@@ -1,4 +1,3 @@
-
 import React, { useState, useEffect, useCallback } from 'react';
 import NcmInput from './components/NcmInput.tsx';
 import InfoDisplay from './components/InfoDisplay.tsx';
@@ -10,8 +9,11 @@ import FileUpload from './components/FileUpload.tsx';
 import Section from './components/Section.tsx';
 import ReportCustomizer from './components/ReportCustomizer.tsx';
 import RollingSumTooltip from './components/charts/RollingSumTooltip.tsx';
-import SurgeAnalysisConfigurator from './components/SurgeAnalysisConfigurator.tsx'; // Novo
-import SurgeAnalysisDisplay from './components/SurgeAnalysisDisplay.tsx'; // Novo
+import SurgeAnalysisConfigurator from './components/SurgeAnalysisConfigurator.tsx';
+import SurgeAnalysisDisplay from './components/SurgeAnalysisDisplay.tsx';
+
+// ✅ Novo módulo (página mock)
+import CgimAnalyticsPage from './components/CgimAnalyticsPage.tsx';
 
 // Service imports
 import { 
@@ -26,6 +28,7 @@ import {
   parseCgimDinteExcelForFiltering,
   parseNfeExcel
 } from './services/excelService.ts';
+
 // Utility imports
 import { 
   processAnnualTradeData,
@@ -34,17 +37,20 @@ import {
   processNfeCnaData,
   ensureVendasInternas,
   processRollingSumImportData,
-  analyzeImportSurge // Novo
+  analyzeImportSurge
 } from './utils/dataProcessing.ts';
-import { formatIntegerPtBR, formatDecimalPtBR, formatNcmCode, parseApiNumber } from './utils/formatting.ts';
+import { formatIntegerPtBR, formatDecimalPtBR, formatNcmCode } from './utils/formatting.ts';
+
 // Type imports
 import { 
-  LastUpdateData, NcmDetails, ProcessedTradeData, ComexStatRecord, ApiFilter, Period, 
+  LastUpdateData, NcmDetails, ProcessedTradeData, ApiFilter, Period, 
   CountryDataRecord, ChartDataPoint, CgimNcmInfo, EntityContactInfo, NfeData,
   YearSummaryData, FormattedNfeSalesData, FormattedNfeCnaData, SectionVisibility,
   RollingSumDataPoint, MonthlyComexStatRecord,
-  SurgeAnalysisConfig, SurgeAnalysisResult // Novo
+  SurgeAnalysisConfig, SurgeAnalysisResult
 } from './types.ts';
+
+type ActiveModule = "ncm" | "cgim";
 
 const initialSectionVisibility: SectionVisibility = {
   showFullHistoricalData: true,
@@ -54,17 +60,20 @@ const initialSectionVisibility: SectionVisibility = {
   showRollingSumImportChart: true,
   showCountryData: true,
   showExcelAnalysis: true,
-  showSurgeAnalysis: true, // Nova seção
+  showSurgeAnalysis: true,
 };
 
 const App: React.FC = () => {
+  // ✅ Estado do módulo (sem router, incremental e seguro)
+  const [activeModule, setActiveModule] = useState<ActiveModule>("ncm");
+
   const [ncmCode, setNcmCode] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [loadingMessage, setLoadingMessage] = useState<string>('');
-  
+
   const [lastUpdateData, setLastUpdateData] = useState<LastUpdateData | null>(null);
   const [ncmDetails, setNcmDetails] = useState<NcmDetails | null>(null);
-  
+
   const [historicalTradeData, setHistoricalTradeData] = useState<ProcessedTradeData[]>([]);
   const [currentYearTradeData, setCurrentYearTradeData] = useState<ProcessedTradeData[]>([]);
   const [combinedTradeData, setCombinedTradeData] = useState<ProcessedTradeData[]>([]);
@@ -72,7 +81,7 @@ const App: React.FC = () => {
 
   const [importSummary, setImportSummary] = useState<YearSummaryData[]>([]);
   const [exportSummary, setExportSummary] = useState<YearSummaryData[]>([]);
-  
+
   // Raw monthly data state
   const [rawMonthlyImportData, setRawMonthlyImportData] = useState<MonthlyComexStatRecord[]>([]);
   const [rollingSumImportData, setRollingSumImportData] = useState<RollingSumDataPoint[]>([]);
@@ -80,7 +89,7 @@ const App: React.FC = () => {
 
   const [importCountryData, setImportCountryData] = useState<CountryDataRecord[]>([]);
   const [exportCountryData, setExportCountryData] = useState<CountryDataRecord[]>([]);
-  
+
   const [cgimFile, setCgimFile] = useState<File | null>(null);
   const [nfeFile, setNfeFile] = useState<File | null>(null);
   const [parsedCgimData, setParsedCgimData] = useState<CgimNcmInfo | null>(null);
@@ -95,7 +104,6 @@ const App: React.FC = () => {
   const [surgeAnalysisResult, setSurgeAnalysisResult] = useState<SurgeAnalysisResult | null>(null);
   const [surgeCalculationLoading, setSurgeCalculationLoading] = useState<boolean>(false);
 
-
   const resetStateForNewNcm = () => {
     setLastUpdateData(null);
     setNcmDetails(null);
@@ -105,8 +113,8 @@ const App: React.FC = () => {
     setResumedTradeData([]);
     setImportSummary([]);
     setExportSummary([]);
-    setRawMonthlyImportData([]); // Reset raw monthly data
-    setRollingSumImportData([]); 
+    setRawMonthlyImportData([]);
+    setRollingSumImportData([]);
     setMonthlyApiDataIssue(false);
     setImportCountryData([]);
     setExportCountryData([]);
@@ -115,9 +123,9 @@ const App: React.FC = () => {
     setParsedNfeDataForNcm([]);
     setNfeSalesTable([]);
     setNfeCnaTable([]);
-    setSurgeAnalysisResult(null); // Reset surge analysis result
+    setSurgeAnalysisResult(null);
   };
-  
+
   const handleNcmSubmit = async (submittedNcmCode: string) => {
     setLoading(true);
     setNcmCode(submittedNcmCode);
@@ -131,63 +139,61 @@ const App: React.FC = () => {
     ]);
     setLastUpdateData(updateData);
     const currentNcmDetails = { description: desc, unit: unit };
-    setNcmDetails(currentNcmDetails); 
+    setNcmDetails(currentNcmDetails);
 
     const filters: ApiFilter[] = [{ filter: "ncm", values: [submittedNcmCode] }];
-    
+
     // Fetch all monthly data from 2019 up to API's last update.
-    // This will be used by both Rolling Sum and Surge Analysis.
     if (updateData.year && updateData.month) {
-        setLoadingMessage('Carregando dados mensais (base para acumulado e surto)...');
-        const monthlyPeriod: Period = { from: "2019-01", to: `${updateData.year}-${String(updateData.month).padStart(2, '0')}` };
-        const fetchedMonthlyData = await fetchMonthlyComexData("import", monthlyPeriod, filters, ["metricFOB", "metricKG"]);
-        
-        if (fetchedMonthlyData && fetchedMonthlyData.length > 0) {
-            setRawMonthlyImportData(fetchedMonthlyData);
-            setMonthlyApiDataIssue(false);
-            if (sectionVisibility.showRollingSumImportChart) {
-                const processedRollingData = processRollingSumImportData(fetchedMonthlyData);
-                setRollingSumImportData(processedRollingData);
-            }
-        } else {
-            setRawMonthlyImportData([]);
-            setMonthlyApiDataIssue(true);
-            if (sectionVisibility.showRollingSumImportChart) setRollingSumImportData([]);
+      setLoadingMessage('Carregando dados mensais (base para acumulado e surto)...');
+      const monthlyPeriod: Period = { from: "2019-01", to: `${updateData.year}-${String(updateData.month).padStart(2, '0')}` };
+      const fetchedMonthlyData = await fetchMonthlyComexData("import", monthlyPeriod, filters, ["metricFOB", "metricKG"]);
+
+      if (fetchedMonthlyData && fetchedMonthlyData.length > 0) {
+        setRawMonthlyImportData(fetchedMonthlyData);
+        setMonthlyApiDataIssue(false);
+        if (sectionVisibility.showRollingSumImportChart) {
+          const processedRollingData = processRollingSumImportData(fetchedMonthlyData);
+          setRollingSumImportData(processedRollingData);
         }
+      } else {
+        setRawMonthlyImportData([]);
+        setMonthlyApiDataIssue(true);
+        if (sectionVisibility.showRollingSumImportChart) setRollingSumImportData([]);
+      }
     }
 
-
     if (sectionVisibility.showFullHistoricalData || sectionVisibility.showResumedHistoricalData || sectionVisibility.showAnnualVariationSummary || sectionVisibility.showAnnualCharts) {
-      const historicalToYear = updateData.year ? updateData.year -1 : new Date().getFullYear() -1;
+      const historicalToYear = updateData.year ? updateData.year - 1 : new Date().getFullYear() - 1;
       const historicalPeriod: Period = { from: "2004-01", to: `${historicalToYear}-12` };
-      
+
       setLoadingMessage('Carregando dados históricos anuais...');
       const histExportMetrics = ["metricFOB", "metricKG", "metricStatistic"];
       const histImportMetrics = ["metricFOB", "metricFreight", "metricInsurance", "metricCIF", "metricKG", "metricStatistic"];
-      
+
       const [histExportDataRaw, histImportDataRaw] = await Promise.all([
-          fetchComexData("export", historicalPeriod, filters, histExportMetrics, ["ncm"]),
-          fetchComexData("import", historicalPeriod, filters, histImportMetrics, ["ncm"])
+        fetchComexData("export", historicalPeriod, filters, histExportMetrics, ["ncm"]),
+        fetchComexData("import", historicalPeriod, filters, histImportMetrics, ["ncm"])
       ]);
-            
+
       const processedHistData = processAnnualTradeData(histExportDataRaw, histImportDataRaw, submittedNcmCode, currentNcmDetails, updateData);
       setHistoricalTradeData(processedHistData);
 
       if (updateData.year && updateData.month) {
         setLoadingMessage('Carregando dados do ano corrente (anualizado)...');
         const currentYearPeriod: Period = { from: `${updateData.year}-01`, to: `${updateData.year}-${String(updateData.month).padStart(2, '0')}` };
-        
+
         const [currentExportDataRaw, currentImportDataRaw] = await Promise.all([
-            fetchComexData("export", currentYearPeriod, filters, histExportMetrics, ["ncm"]),
-            fetchComexData("import", currentYearPeriod, filters, histImportMetrics, ["ncm"])
+          fetchComexData("export", currentYearPeriod, filters, histExportMetrics, ["ncm"]),
+          fetchComexData("import", currentYearPeriod, filters, histImportMetrics, ["ncm"])
         ]);
 
         const processedCurrentData = processAnnualTradeData(currentExportDataRaw, currentImportDataRaw, submittedNcmCode, currentNcmDetails, updateData);
         setCurrentYearTradeData(processedCurrentData);
-        
-        const allData = [...processedHistData, ...processedCurrentData].sort((a,b) => parseInt(a.year.substring(0,4)) - parseInt(b.year.substring(0,4)));
+
+        const allData = [...processedHistData, ...processedCurrentData].sort((a, b) => parseInt(a.year.substring(0, 4)) - parseInt(b.year.substring(0, 4)));
         setCombinedTradeData(allData);
-        
+
         const resumed = allData.map(d => ({
           year: d.year,
           'Exportações (US$ FOB)': d['Exportações (US$ FOB)'],
@@ -196,74 +202,71 @@ const App: React.FC = () => {
           'Importações (KG)': d['Importações (KG)'],
           'Balança Comercial (FOB)': d['Balança Comercial (FOB)'],
           'Balança Comercial (KG)': d['Balança Comercial (KG)'],
-        } as ProcessedTradeData)); 
+        } as ProcessedTradeData));
         setResumedTradeData(resumed);
 
-        if(sectionVisibility.showAnnualVariationSummary){
+        if (sectionVisibility.showAnnualVariationSummary) {
           setImportSummary(createYearSummary(allData, 'import'));
           setExportSummary(createYearSummary(allData, 'export'));
         }
       }
     }
 
-    if(sectionVisibility.showCountryData){
+    if (sectionVisibility.showCountryData) {
       setLoadingMessage('Carregando dados por país (2024)...');
       const [expCountries, impCountries] = await Promise.all([
-          fetchCountryData(submittedNcmCode, "export", 2024),
-          fetchCountryData(submittedNcmCode, "import", 2024)
+        fetchCountryData(submittedNcmCode, "export", 2024),
+        fetchCountryData(submittedNcmCode, "import", 2024)
       ]);
       setExportCountryData(expCountries);
       setImportCountryData(impCountries);
     }
-    
+
     if (sectionVisibility.showExcelAnalysis) {
-        if (cgimFile) await handleCgimFileUpload(cgimFile, submittedNcmCode, true); 
-        if (nfeFile) await handleNfeFileUpload(nfeFile, submittedNcmCode, true); 
+      if (cgimFile) await handleCgimFileUpload(cgimFile, submittedNcmCode, true);
+      if (nfeFile) await handleNfeFileUpload(nfeFile, submittedNcmCode, true);
     }
 
     setLoadingMessage('');
     setLoading(false);
   };
-  
+
   useEffect(() => {
     const fetchDataForNewlySelectedSections = async () => {
-      if (!ncmCode || !lastUpdateData || !ncmDetails) return; 
+      if (!ncmCode || !lastUpdateData || !ncmDetails) return;
 
-      setLoading(true); 
+      setLoading(true);
       const filters: ApiFilter[] = [{ filter: "ncm", values: [ncmCode] }];
 
-      // Fetch raw monthly data if not already fetched
       if (rawMonthlyImportData.length === 0 && lastUpdateData.year && lastUpdateData.month) {
         setLoadingMessage('Carregando dados mensais (base para acumulado e surto)...');
         const monthlyPeriod: Period = { from: "2019-01", to: `${lastUpdateData.year}-${String(lastUpdateData.month).padStart(2, '0')}` };
         const fetchedMonthlyData = await fetchMonthlyComexData("import", monthlyPeriod, filters, ["metricFOB", "metricKG"]);
         if (fetchedMonthlyData && fetchedMonthlyData.length > 0) {
-            setRawMonthlyImportData(fetchedMonthlyData);
-            setMonthlyApiDataIssue(false);
+          setRawMonthlyImportData(fetchedMonthlyData);
+          setMonthlyApiDataIssue(false);
         } else {
-            setRawMonthlyImportData([]);
-            setMonthlyApiDataIssue(true);
+          setRawMonthlyImportData([]);
+          setMonthlyApiDataIssue(true);
         }
       }
-      
-      // Process rolling sum if section is visible AND raw monthly data is available AND rolling sum data is not yet processed
-      if (sectionVisibility.showRollingSumImportChart && rawMonthlyImportData.length > 0 && rollingSumImportData.length === 0) {
-          setLoadingMessage('Processando dados para gráfico de acumulado...');
-          const processedRollingData = processRollingSumImportData(rawMonthlyImportData);
-          setRollingSumImportData(processedRollingData);
-      }
 
+      if (sectionVisibility.showRollingSumImportChart && rawMonthlyImportData.length > 0 && rollingSumImportData.length === 0) {
+        setLoadingMessage('Processando dados para gráfico de acumulado...');
+        const processedRollingData = processRollingSumImportData(rawMonthlyImportData);
+        setRollingSumImportData(processedRollingData);
+      }
 
       if ((sectionVisibility.showFullHistoricalData || sectionVisibility.showResumedHistoricalData || sectionVisibility.showAnnualVariationSummary || sectionVisibility.showAnnualCharts) && combinedTradeData.length === 0) {
         setLoadingMessage('Carregando dados históricos/atuais anuais...');
-        const historicalToYear = lastUpdateData.year ? lastUpdateData.year -1 : new Date().getFullYear() -1;
+        const historicalToYear = lastUpdateData.year ? lastUpdateData.year - 1 : new Date().getFullYear() - 1;
         const historicalPeriod: Period = { from: "2004-01", to: `${historicalToYear}-12` };
         const histExportMetrics = ["metricFOB", "metricKG", "metricStatistic"];
         const histImportMetrics = ["metricFOB", "metricFreight", "metricInsurance", "metricCIF", "metricKG", "metricStatistic"];
 
         const [histExportDataRaw, histImportDataRaw] = await Promise.all([
-            fetchComexData("export", historicalPeriod, filters, histExportMetrics, ["ncm"]),
-            fetchComexData("import", historicalPeriod, filters, histImportMetrics, ["ncm"])
+          fetchComexData("export", historicalPeriod, filters, histExportMetrics, ["ncm"]),
+          fetchComexData("import", historicalPeriod, filters, histImportMetrics, ["ncm"])
         ]);
         const processedHistData = processAnnualTradeData(histExportDataRaw, histImportDataRaw, ncmCode, ncmDetails, lastUpdateData);
         setHistoricalTradeData(processedHistData);
@@ -276,10 +279,10 @@ const App: React.FC = () => {
           ]);
           const processedCurrentData = processAnnualTradeData(currentExportDataRaw, currentImportDataRaw, ncmCode, ncmDetails, lastUpdateData);
           setCurrentYearTradeData(processedCurrentData);
-          
-          const allData = [...processedHistData, ...processedCurrentData].sort((a,b) => parseInt(a.year.substring(0,4)) - parseInt(b.year.substring(0,4)));
+
+          const allData = [...processedHistData, ...processedCurrentData].sort((a, b) => parseInt(a.year.substring(0, 4)) - parseInt(b.year.substring(0, 4)));
           setCombinedTradeData(allData);
-          
+
           const resumed = allData.map(d => ({
             year: d.year,
             'Exportações (US$ FOB)': d['Exportações (US$ FOB)'],
@@ -288,10 +291,10 @@ const App: React.FC = () => {
             'Importações (KG)': d['Importações (KG)'],
             'Balança Comercial (FOB)': d['Balança Comercial (FOB)'],
             'Balança Comercial (KG)': d['Balança Comercial (KG)'],
-          } as ProcessedTradeData)); 
+          } as ProcessedTradeData));
           setResumedTradeData(resumed);
 
-          if(sectionVisibility.showAnnualVariationSummary && (importSummary.length === 0 && exportSummary.length === 0)){ 
+          if (sectionVisibility.showAnnualVariationSummary && (importSummary.length === 0 && exportSummary.length === 0)) {
             setImportSummary(createYearSummary(allData, 'import'));
             setExportSummary(createYearSummary(allData, 'export'));
           }
@@ -301,47 +304,47 @@ const App: React.FC = () => {
       if (sectionVisibility.showCountryData && importCountryData.length === 0 && exportCountryData.length === 0) {
         setLoadingMessage('Carregando dados por país...');
         const [expCountries, impCountries] = await Promise.all([
-            fetchCountryData(ncmCode, "export", 2024),
-            fetchCountryData(ncmCode, "import", 2024)
+          fetchCountryData(ncmCode, "export", 2024),
+          fetchCountryData(ncmCode, "import", 2024)
         ]);
         setExportCountryData(expCountries);
         setImportCountryData(impCountries);
       }
-      
-      if(sectionVisibility.showExcelAnalysis) {
-        if(cgimFile && (!parsedCgimData || parsedCgimData?.['NCM'] !== ncmCode) && parsedEntityContacts.filter(c=>c.NCM === ncmCode).length === 0) {
-            await handleCgimFileUpload(cgimFile, ncmCode, false); 
+
+      if (sectionVisibility.showExcelAnalysis) {
+        if (cgimFile && (!parsedCgimData || parsedCgimData?.['NCM'] !== ncmCode) && parsedEntityContacts.filter(c => c.NCM === ncmCode).length === 0) {
+          await handleCgimFileUpload(cgimFile, ncmCode, false);
         }
-        if(nfeFile && parsedNfeDataForNcm.filter(d => d.ncm_8d === ncmCode).length === 0 ) {
-            await handleNfeFileUpload(nfeFile, ncmCode, false); 
+        if (nfeFile && parsedNfeDataForNcm.filter(d => d.ncm_8d === ncmCode).length === 0) {
+          await handleNfeFileUpload(nfeFile, ncmCode, false);
         }
       }
+
       setLoading(false);
       setLoadingMessage('');
     };
 
-    if (ncmCode) { 
-        fetchDataForNewlySelectedSections();
+    if (ncmCode) {
+      fetchDataForNewlySelectedSections();
     }
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [sectionVisibility, ncmCode]); 
-
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sectionVisibility, ncmCode]);
 
   const handleCgimFileUpload = useCallback(async (file: File, currentNcm: string | null = ncmCode, forceReprocess: boolean = false) => {
     if (!currentNcm) {
-        setCgimFile(file); 
-        return;
+      setCgimFile(file);
+      return;
     }
     if (!forceReprocess && parsedCgimData && parsedCgimData['NCM'] === currentNcm && parsedEntityContacts.some(c => c.NCM === currentNcm)) return;
 
     setLoading(true);
     setLoadingMessage('Processando arquivo CGIM/DINTE...');
-    setCgimFile(file); 
+    setCgimFile(file);
     try {
       const { cgimData, entityData } = await parseCgimDinteExcelForFiltering(file);
       const ncmInfo = cgimData.find(row => row['NCM'] === currentNcm);
       setParsedCgimData(ncmInfo || null);
-      
+
       const contacts = entityData.filter(row => row['NCM'] === currentNcm);
       setParsedEntityContacts(contacts);
 
@@ -356,19 +359,19 @@ const App: React.FC = () => {
   }, [ncmCode, parsedCgimData, parsedEntityContacts]);
 
   const handleNfeFileUpload = useCallback(async (file: File, currentNcm: string | null = ncmCode, forceReprocess: boolean = false) => {
-     if (!currentNcm) {
-        setNfeFile(file); 
-        return;
+    if (!currentNcm) {
+      setNfeFile(file);
+      return;
     }
-    if (!forceReprocess && parsedNfeDataForNcm.some(d => d.ncm_8d === currentNcm)) return; 
+    if (!forceReprocess && parsedNfeDataForNcm.some(d => d.ncm_8d === currentNcm)) return;
 
     setLoading(true);
     setLoadingMessage('Processando arquivo NFE...');
-    setNfeFile(file); 
+    setNfeFile(file);
     try {
       const allNfeData = await parseNfeExcel(file);
       const nfeForNcm = allNfeData.filter(row => row.ncm_8d === currentNcm);
-      const nfeForNcmWithVendasInternas = ensureVendasInternas(nfeForNcm); 
+      const nfeForNcmWithVendasInternas = ensureVendasInternas(nfeForNcm);
       setParsedNfeDataForNcm(nfeForNcmWithVendasInternas);
 
       if (nfeForNcmWithVendasInternas.length > 0) {
@@ -419,7 +422,6 @@ const App: React.FC = () => {
     setSurgeCalculationLoading(false);
   }, [rawMonthlyImportData, lastUpdateData]);
 
-
   // Table definitions
   const tradeTableColumns = [
     { key: 'year', header: 'Ano', LTR: true },
@@ -444,13 +446,13 @@ const App: React.FC = () => {
     { key: 'Preço Médio Importação (US$/KG)', header: 'Preço Médio Imp (US$/KG)' },
   ];
   const tradeTableFormatters = Object.fromEntries(
-      tradeTableColumns.filter(c => !['year', 'Código NCM', 'Descrição NCM', 'Unidade Estatística'].includes(c.key))
-          .map(c => [
-              c.key, 
-              (c.key.includes('Preço Médio') || c.key.includes('US$/KG')) ? formatDecimalPtBR : formatIntegerPtBR
-          ])
+    tradeTableColumns.filter(c => !['year', 'Código NCM', 'Descrição NCM', 'Unidade Estatística'].includes(c.key))
+      .map(c => [
+        c.key,
+        (c.key.includes('Preço Médio') || c.key.includes('US$/KG')) ? formatDecimalPtBR : formatIntegerPtBR
+      ])
   );
-  
+
   const resumedTableColumns = [
     { key: 'year', header: 'Ano', LTR: true },
     { key: 'Exportações (US$ FOB)', header: 'Exp (US$ FOB)' },
@@ -460,19 +462,19 @@ const App: React.FC = () => {
     { key: 'Balança Comercial (FOB)', header: 'Balança (FOB)' },
     { key: 'Balança Comercial (KG)', header: 'Balança (KG)' },
   ];
-   const resumedTableFormatters = Object.fromEntries(
-      resumedTableColumns.filter(c => c.key !=='year')
-          .map(c => [c.key, formatIntegerPtBR])
+  const resumedTableFormatters = Object.fromEntries(
+    resumedTableColumns.filter(c => c.key !== 'year')
+      .map(c => [c.key, formatIntegerPtBR])
   );
 
   const importSummaryColumns = [
     { key: 'Ano', header: 'Ano', LTR: true },
-    { key: 'Importações (US$ FOB)', header: 'Imp (US$ FOB)'},
-    { key: 'Var. (%) Imp (US$ FOB)', header: 'Var. (%) FOB'},
-    { key: 'Importações (kg)', header: 'Imp (kg)'},
-    { key: 'Var. (%) Imp (kg)', header: 'Var. (%) kg'},
-    { key: 'Preço médio Importação (US$ FOB/Ton)', header: 'Preço Médio (US$/Ton)'},
-    { key: 'Var. (%) Preço médio Imp', header: 'Var. (%) Preço Médio'},
+    { key: 'Importações (US$ FOB)', header: 'Imp (US$ FOB)' },
+    { key: 'Var. (%) Imp (US$ FOB)', header: 'Var. (%) FOB' },
+    { key: 'Importações (kg)', header: 'Imp (kg)' },
+    { key: 'Var. (%) Imp (kg)', header: 'Var. (%) kg' },
+    { key: 'Preço médio Importação (US$ FOB/Ton)', header: 'Preço Médio (US$/Ton)' },
+    { key: 'Var. (%) Preço médio Imp', header: 'Var. (%) Preço Médio' },
   ];
   const importSummaryFormatters = {
     'Importações (US$ FOB)': formatIntegerPtBR,
@@ -482,14 +484,14 @@ const App: React.FC = () => {
 
   const exportSummaryColumns = [
     { key: 'Ano', header: 'Ano', LTR: true },
-    { key: 'Exportações (US$ FOB)', header: 'Exp (US$ FOB)'},
-    { key: 'Var. (%) Exp (US$ FOB)', header: 'Var. (%) FOB'},
-    { key: 'Exportações (kg)', header: 'Exp (kg)'},
-    { key: 'Var. (%) Exp (kg)', header: 'Var. (%) kg'},
-    { key: 'Preço médio Exp (US$ FOB/Ton)', header: 'Preço Médio (US$/Ton)'},
-    { key: 'Var. (%) Preço médio Exp', header: 'Var. (%) Preço Médio'},
+    { key: 'Exportações (US$ FOB)', header: 'Exp (US$ FOB)' },
+    { key: 'Var. (%) Exp (US$ FOB)', header: 'Var. (%) FOB' },
+    { key: 'Exportações (kg)', header: 'Exp (kg)' },
+    { key: 'Var. (%) Exp (kg)', header: 'Var. (%) kg' },
+    { key: 'Preço médio Exp (US$ FOB/Ton)', header: 'Preço Médio (US$/Ton)' },
+    { key: 'Var. (%) Preço médio Exp', header: 'Var. (%) Preço Médio' },
   ];
-    const exportSummaryFormatters = {
+  const exportSummaryFormatters = {
     'Exportações (US$ FOB)': formatIntegerPtBR,
     'Exportações (kg)': formatIntegerPtBR,
     'Preço médio Exp (US$ FOB/Ton)': formatDecimalPtBR,
@@ -497,16 +499,16 @@ const App: React.FC = () => {
 
   const countryTableColumns = [
     { key: 'country', header: 'País', LTR: true },
-    { key: 'metricFOB', header: 'Valor (US$ FOB)'},
-    { key: 'metricKG', header: 'Peso (KG)'},
-    { key: 'representatividadeFOB', header: 'Rep. FOB (%)'},
-    { key: 'representatividadeKG', header: 'Rep. KG (%)'},
+    { key: 'metricFOB', header: 'Valor (US$ FOB)' },
+    { key: 'metricKG', header: 'Peso (KG)' },
+    { key: 'representatividadeFOB', header: 'Rep. FOB (%)' },
+    { key: 'representatividadeKG', header: 'Rep. KG (%)' },
   ];
   const countryTableFormatters = {
     'metricFOB': formatIntegerPtBR,
     'metricKG': formatIntegerPtBR,
-    'representatividadeFOB': (v:number) => formatDecimalPtBR(v) + '%',
-    'representatividadeKG': (v:number) => formatDecimalPtBR(v) + '%',
+    'representatividadeFOB': (v: number) => formatDecimalPtBR(v) + '%',
+    'representatividadeKG': (v: number) => formatDecimalPtBR(v) + '%',
   };
 
   const cgimNcmInfoColumns = [
@@ -535,7 +537,7 @@ const App: React.FC = () => {
     { key: 'Telefone (Contato Importante)', header: 'Telefone (Contato Importante)', LTR: true },
     { key: 'Celular (Contato Importante)', header: 'Celular (Contato Importante)', LTR: true },
   ];
-  
+
   const nfeFullDataColumns = [
     { key: 'ano', header: 'Ano', LTR: true },
     { key: 'ncm_8d', header: 'NCM', LTR: true },
@@ -577,7 +579,7 @@ const App: React.FC = () => {
     'disponibilidade_total_qtd': formatIntegerPtBR,
     'Vendas internas (KG)': formatIntegerPtBR,
   };
-  
+
   const nfeSalesTableColumns = [
     { key: 'ano', header: 'Ano', LTR: true },
     { key: 'Vendas totais (Kg)', header: 'Vendas Totais (Kg)', LTR: true },
@@ -601,7 +603,7 @@ const App: React.FC = () => {
 
   // Chart data preparation
   const chartDataKg = combinedTradeData
-    .filter(d => parseInt(d.year.substring(0,4)) >= 2010)
+    .filter(d => parseInt(d.year.substring(0, 4)) >= 2010)
     .map(d => ({
       name: d.year,
       'Importações (KG)': d['Importações (KG)'],
@@ -609,7 +611,7 @@ const App: React.FC = () => {
     }));
 
   const chartDataFob = combinedTradeData
-    .filter(d => parseInt(d.year.substring(0,4)) >= 2010)
+    .filter(d => parseInt(d.year.substring(0, 4)) >= 2010)
     .map(d => ({
       name: d.year,
       'Importações (US$ FOB)': d['Importações (US$ FOB)'],
@@ -617,7 +619,7 @@ const App: React.FC = () => {
     }));
 
   const chartDataPrices = combinedTradeData
-    .filter(d => parseInt(d.year.substring(0,4)) >= 2010)
+    .filter(d => parseInt(d.year.substring(0, 4)) >= 2010)
     .map(d => ({
       name: d.year,
       'Preço Médio Importação (US$/KG)': d['Preço Médio Importação (US$/KG)'],
@@ -625,20 +627,20 @@ const App: React.FC = () => {
     }));
 
   const chartDataBalance: ChartDataPoint[] = combinedTradeData.map(d => ({
-    name: d.year, 
+    name: d.year,
     'Exportações (US$ FOB)': d['Exportações (US$ FOB)'] || 0,
-    'Importações (US$ FOB) Neg': -(d['Importações (US$ FOB)'] || 0), 
+    'Importações (US$ FOB) Neg': -(d['Importações (US$ FOB)'] || 0),
     'Balança Comercial (FOB)': d['Balança Comercial (FOB)'] || 0,
   }));
-  
+
   const chartDataForRollingSumKg: ChartDataPoint[] = rollingSumImportData.map(d => ({
-    name: d.yearMonth, 
+    name: d.yearMonth,
     rollingKG: d.rollingKG,
   }));
 
   const barChartColors = (data: any[], index: number) => {
-    if (index === data.length - 2) return 'sandybrown'; 
-    if (index === data.length - 1) return 'darksalmon'; 
+    if (index === data.length - 2) return 'sandybrown';
+    if (index === data.length - 1) return 'darksalmon';
     return 'orange';
   };
 
@@ -648,9 +650,9 @@ const App: React.FC = () => {
     return 'steelblue';
   };
 
-  const showNoDataMessage = ncmCode && !loading && 
+  const showNoDataMessage = ncmCode && !loading &&
     (
-      (!sectionVisibility.showFullHistoricalData && !sectionVisibility.showResumedHistoricalData && !sectionVisibility.showAnnualVariationSummary && !sectionVisibility.showAnnualCharts) || 
+      (!sectionVisibility.showFullHistoricalData && !sectionVisibility.showResumedHistoricalData && !sectionVisibility.showAnnualVariationSummary && !sectionVisibility.showAnnualCharts) ||
       combinedTradeData.length === 0
     ) &&
     (!sectionVisibility.showRollingSumImportChart || (rollingSumImportData.length === 0 && !monthlyApiDataIssue)) &&
@@ -659,226 +661,337 @@ const App: React.FC = () => {
       (!cgimFile || (!parsedCgimData && parsedEntityContacts.length === 0)) &&
       (!nfeFile || parsedNfeDataForNcm.length === 0)
     )) &&
-    (!sectionVisibility.showSurgeAnalysis || !surgeAnalysisResult || surgeAnalysisResult.error) && // Added surge
+    (!sectionVisibility.showSurgeAnalysis || !surgeAnalysisResult || surgeAnalysisResult.error) &&
     (
       (sectionVisibility.showFullHistoricalData && combinedTradeData.length === 0) ||
       (sectionVisibility.showResumedHistoricalData && resumedTradeData.length === 0) ||
       (sectionVisibility.showAnnualVariationSummary && importSummary.length === 0 && exportSummary.length === 0) ||
       (sectionVisibility.showAnnualCharts && combinedTradeData.length === 0) ||
-      (sectionVisibility.showRollingSumImportChart && rollingSumImportData.length === 0 && !monthlyApiDataIssue) || 
+      (sectionVisibility.showRollingSumImportChart && rollingSumImportData.length === 0 && !monthlyApiDataIssue) ||
       (sectionVisibility.showCountryData && importCountryData.length === 0 && exportCountryData.length === 0)
     );
 
-
   return (
     <div className="container mx-auto p-4 md:p-8 bg-gray-50 min-h-screen">
-      <header className="mb-8 text-center">
+      <header className="mb-6 text-center">
         <h1 className="text-4xl font-extrabold text-transparent bg-clip-text bg-gradient-to-r from-blue-600 to-indigo-700 py-2">
-          Analisador Comex Stat NCM
+          Comexsetor
         </h1>
-        <p className="text-gray-600 mt-1">Ferramenta para análise de dados de comércio exterior brasileiro.</p>
+        <p className="text-gray-600 mt-1">
+          Ferramenta para análise de comércio exterior (NCM) e análises setoriais (CGIM).
+        </p>
+
+        {/* ✅ Menu de módulos (incremental, sem router) */}
+        <div className="mt-5 flex items-center justify-center gap-3">
+          <button
+            onClick={() => setActiveModule("ncm")}
+            className={`px-4 py-2 rounded-md font-semibold border shadow-sm ${
+              activeModule === "ncm"
+                ? "bg-white border-blue-500 text-blue-700"
+                : "bg-gray-100 border-gray-200 text-gray-700 hover:bg-gray-200"
+            }`}
+          >
+            Análises por NCM
+          </button>
+          <button
+            onClick={() => setActiveModule("cgim")}
+            className={`px-4 py-2 rounded-md font-semibold border shadow-sm ${
+              activeModule === "cgim"
+                ? "bg-white border-blue-500 text-blue-700"
+                : "bg-gray-100 border-gray-200 text-gray-700 hover:bg-gray-200"
+            }`}
+          >
+            Análises CGIM (Setorial)
+          </button>
+        </div>
       </header>
 
-      {!ncmCode && !loading && (
-        <div className="text-center p-10 bg-white shadow-lg rounded-lg">
-          <p className="text-xl text-gray-700">Por favor, insira um código NCM e selecione as seções desejadas no relatório para iniciar a análise.</p>
-        </div>
-      )}
-
-      <NcmInput onSubmit={handleNcmSubmit} loading={loading} />
-      <ReportCustomizer visibility={sectionVisibility} onVisibilityChange={setSectionVisibility} />
-      
-      {loading && loadingMessage && <p className="text-center text-blue-600 my-4 p-3 bg-blue-50 rounded-md shadow">{loadingMessage}</p>}
-      
-      {ncmCode && <InfoDisplay ncmCode={ncmCode} lastUpdateData={lastUpdateData} ncmDetails={ncmDetails} appIsLoading={loading} />}
-
-
-      {ncmCode && !loading && (
+      {/* ✅ Render do módulo CGIM sem interferir no módulo NCM */}
+      {activeModule === "cgim" ? (
+        <CgimAnalyticsPage />
+      ) : (
         <>
-          {sectionVisibility.showFullHistoricalData && combinedTradeData.length > 0 && (
-            <Section title="Dados Históricos Consolidados (Comex Stat)" defaultOpen={false}>
-              <DataTable title={`Dados Consolidados para NCM ${formatNcmCode(ncmCode)}`} data={combinedTradeData} columns={tradeTableColumns} formatters={tradeTableFormatters} source="Fonte: Comex Stat/MDIC. Elaboração própria."/>
-            </Section>
+          {!ncmCode && !loading && (
+            <div className="text-center p-10 bg-white shadow-lg rounded-lg">
+              <p className="text-xl text-gray-700">
+                Por favor, insira um código NCM e selecione as seções desejadas no relatório para iniciar a análise.
+              </p>
+            </div>
           )}
 
-          {sectionVisibility.showResumedHistoricalData && resumedTradeData.length > 0 && (
-            <Section title="Dados Anuais Resumidos (Comex Stat)" defaultOpen={true}>
-              <DataTable title={`Dados Resumidos para NCM ${formatNcmCode(ncmCode)}`} data={resumedTradeData} columns={resumedTableColumns} formatters={resumedTableFormatters} source="Fonte: Comex Stat/MDIC. Elaboração própria."/>
-            </Section>
+          <NcmInput onSubmit={handleNcmSubmit} loading={loading} />
+          <ReportCustomizer visibility={sectionVisibility} onVisibilityChange={setSectionVisibility} />
+
+          {loading && loadingMessage && (
+            <p className="text-center text-blue-600 my-4 p-3 bg-blue-50 rounded-md shadow">{loadingMessage}</p>
           )}
 
-          {sectionVisibility.showAnnualVariationSummary && (importSummary.length > 0 || exportSummary.length > 0) && (
-            <Section title="Quadros Resumo de Variação Anual (Importação e Exportação)" defaultOpen={true}>
-              {importSummary.length > 0 && <DataTable title="Quadro Resumo das Importações (Variação Anual)" data={importSummary} columns={importSummaryColumns} formatters={importSummaryFormatters} source="Fonte: Comex Stat/MDIC. Elaboração própria."/>}
-              {exportSummary.length > 0 && <DataTable title="Quadro Resumo das Exportações (Variação Anual)" data={exportSummary} columns={exportSummaryColumns} formatters={exportSummaryFormatters} source="Fonte: Comex Stat/MDIC. Elaboração própria."/>}
-            </Section>
+          {ncmCode && (
+            <InfoDisplay ncmCode={ncmCode} lastUpdateData={lastUpdateData} ncmDetails={ncmDetails} appIsLoading={loading} />
           )}
-          
-          {sectionVisibility.showAnnualCharts && combinedTradeData.length > 0 && (
-            <Section title="Gráficos Anuais (Comex Stat)" defaultOpen={true}>
-              <div className="grid md:grid-cols-2 gap-6">
-                  <SimpleBarChart 
-                      data={chartDataKg} 
-                      xAxisKey="name" 
-                      dataKey="Importações (KG)" 
+
+          {ncmCode && !loading && (
+            <>
+              {sectionVisibility.showFullHistoricalData && combinedTradeData.length > 0 && (
+                <Section title="Dados Históricos Consolidados (Comex Stat)" defaultOpen={false}>
+                  <DataTable
+                    title={`Dados Consolidados para NCM ${formatNcmCode(ncmCode)}`}
+                    data={combinedTradeData}
+                    columns={tradeTableColumns}
+                    formatters={tradeTableFormatters}
+                    source="Fonte: Comex Stat/MDIC. Elaboração própria."
+                  />
+                </Section>
+              )}
+
+              {sectionVisibility.showResumedHistoricalData && resumedTradeData.length > 0 && (
+                <Section title="Dados Anuais Resumidos (Comex Stat)" defaultOpen={true}>
+                  <DataTable
+                    title={`Dados Resumidos para NCM ${formatNcmCode(ncmCode)}`}
+                    data={resumedTradeData}
+                    columns={resumedTableColumns}
+                    formatters={resumedTableFormatters}
+                    source="Fonte: Comex Stat/MDIC. Elaboração própria."
+                  />
+                </Section>
+              )}
+
+              {sectionVisibility.showAnnualVariationSummary && (importSummary.length > 0 || exportSummary.length > 0) && (
+                <Section title="Quadros Resumo de Variação Anual (Importação e Exportação)" defaultOpen={true}>
+                  {importSummary.length > 0 && (
+                    <DataTable
+                      title="Quadro Resumo das Importações (Variação Anual)"
+                      data={importSummary}
+                      columns={importSummaryColumns}
+                      formatters={importSummaryFormatters}
+                      source="Fonte: Comex Stat/MDIC. Elaboração própria."
+                    />
+                  )}
+                  {exportSummary.length > 0 && (
+                    <DataTable
+                      title="Quadro Resumo das Exportações (Variação Anual)"
+                      data={exportSummary}
+                      columns={exportSummaryColumns}
+                      formatters={exportSummaryFormatters}
+                      source="Fonte: Comex Stat/MDIC. Elaboração própria."
+                    />
+                  )}
+                </Section>
+              )}
+
+              {sectionVisibility.showAnnualCharts && combinedTradeData.length > 0 && (
+                <Section title="Gráficos Anuais (Comex Stat)" defaultOpen={true}>
+                  <div className="grid md:grid-cols-2 gap-6">
+                    <SimpleBarChart
+                      data={chartDataKg}
+                      xAxisKey="name"
+                      dataKey="Importações (KG)"
                       title={`Importações (KG) da NCM ${formatNcmCode(ncmCode)} (desde 2010)`}
                       yAxisLabel="Importações (KG)"
                       fillColor={(entry, index) => barChartColors(chartDataKg, index)}
-                  />
-                  <SimpleBarChart 
-                      data={chartDataFob} 
-                      xAxisKey="name" 
-                      dataKey="Importações (US$ FOB)" 
+                    />
+                    <SimpleBarChart
+                      data={chartDataFob}
+                      xAxisKey="name"
+                      dataKey="Importações (US$ FOB)"
                       title={`Importações (US$ FOB) da NCM ${formatNcmCode(ncmCode)} (desde 2010)`}
                       yAxisLabel="Importações (US$ FOB)"
                       fillColor={(entry, index) => barChartColors(chartDataFob, index)}
-                  />
-                  <SimpleBarChart 
-                      data={chartDataKg} 
-                      xAxisKey="name" 
-                      dataKey="Exportações (KG)" 
+                    />
+                    <SimpleBarChart
+                      data={chartDataKg}
+                      xAxisKey="name"
+                      dataKey="Exportações (KG)"
                       title={`Exportações (KG) da NCM ${formatNcmCode(ncmCode)} (desde 2010)`}
                       yAxisLabel="Exportações (KG)"
                       fillColor={(entry, index) => barChartColorsExports(chartDataKg, index)}
-                  />
-                  <SimpleBarChart 
-                      data={chartDataFob} 
-                      xAxisKey="name" 
-                      dataKey="Exportações (US$ FOB)" 
+                    />
+                    <SimpleBarChart
+                      data={chartDataFob}
+                      xAxisKey="name"
+                      dataKey="Exportações (US$ FOB)"
                       title={`Exportações (US$ FOB) da NCM ${formatNcmCode(ncmCode)} (desde 2010)`}
                       yAxisLabel="Exportações (US$ FOB)"
                       fillColor={(entry, index) => barChartColorsExports(chartDataFob, index)}
+                    />
+                  </div>
+                  <SimpleLineChart
+                    data={chartDataPrices}
+                    xAxisKey="name"
+                    lines={[
+                      { dataKey: 'Preço Médio Importação (US$/KG)', name: 'Preço Médio Importação (US$/KG)', color: '#FF0000' },
+                      { dataKey: 'Preço Médio Exportação (US$/KG)', name: 'Preço Médio Exportação (US$/KG)', color: '#0000FF' },
+                    ]}
+                    title={`Preços Médios de Importação e Exportação (US$/KG) da NCM ${formatNcmCode(ncmCode)} (desde 2010)`}
+                    yAxisLabel="Preço Médio (US$/KG)"
                   />
-              </div>
-              <SimpleLineChart
-                  data={chartDataPrices}
-                  xAxisKey="name"
-                  lines={[
-                      { dataKey: 'Preço Médio Importação (US$/KG)', name: 'Preço Médio Importação (US$/KG)', color: '#FF0000' }, 
-                      { dataKey: 'Preço Médio Exportação (US$/KG)', name: 'Preço Médio Exportação (US$/KG)', color: '#0000FF' }, 
-                  ]}
-                  title={`Preços Médios de Importação e Exportação (US$/KG) da NCM ${formatNcmCode(ncmCode)} (desde 2010)`}
-                  yAxisLabel="Preço Médio (US$/KG)"
-              />
-              <CombinedTradeBalanceChart data={chartDataBalance} title={`Exportação, Importação e Balança Comercial (US$ FOB) – NCM ${formatNcmCode(ncmCode)}`}/>
-            </Section>
+                  <CombinedTradeBalanceChart
+                    data={chartDataBalance}
+                    title={`Exportação, Importação e Balança Comercial (US$ FOB) – NCM ${formatNcmCode(ncmCode)}`}
+                  />
+                </Section>
+              )}
+
+              {sectionVisibility.showRollingSumImportChart && (
+                <Section title="Gráfico de Importação Acumulada (12 Meses)" defaultOpen={true}>
+                  {rawMonthlyImportData.length > 0 && !monthlyApiDataIssue ? (
+                    <SimpleBarChart
+                      data={chartDataForRollingSumKg}
+                      xAxisKey="name"
+                      dataKey="rollingKG"
+                      title={`Importação Acumulada (KG) nos Últimos 12 Meses - NCM ${formatNcmCode(ncmCode!)}`}
+                      yAxisLabel="Quantidade Acumulada (KG)"
+                      fillColor="steelblue"
+                      customTooltip={<RollingSumTooltip />}
+                      showLegend={false}
+                    />
+                  ) : monthlyApiDataIssue ? (
+                    <div className="p-4 bg-orange-50 border border-orange-200 rounded-md text-center">
+                      <p className="text-orange-700 font-semibold text-lg">
+                        Não foi possível gerar o gráfico de importação acumulada.
+                      </p>
+                      <p className="text-gray-600 mt-2">
+                        A API Comex Stat não retornou dados mensais válidos para o NCM{' '}
+                        <span className="font-mono bg-gray-200 px-1 rounded">{formatNcmCode(ncmCode!)}</span>.
+                      </p>
+                    </div>
+                  ) : (
+                    <SimpleBarChart data={[]} xAxisKey="name" dataKey="rollingKG" title={`Importação Acumulada (KG) - NCM ${formatNcmCode(ncmCode!)}`} />
+                  )}
+                </Section>
+              )}
+
+              {sectionVisibility.showSurgeAnalysis && ncmCode && (
+                <Section title="Análise de Surto de Importação" defaultOpen={true}>
+                  <SurgeAnalysisConfigurator
+                    onCalculate={handleCalculateSurge}
+                    isLoading={surgeCalculationLoading}
+                    lastUpdateData={lastUpdateData}
+                  />
+                  <SurgeAnalysisDisplay result={surgeAnalysisResult} isLoading={surgeCalculationLoading} />
+                </Section>
+              )}
+
+              {sectionVisibility.showCountryData && (importCountryData.length > 0 || exportCountryData.length > 0) && (
+                <Section title="Dados por País (2024)" defaultOpen={false}>
+                  {importCountryData.length > 0 && (
+                    <DataTable
+                      title={`Principais Origens das Importações (2024) - NCM ${formatNcmCode(ncmCode)}`}
+                      data={importCountryData}
+                      columns={countryTableColumns}
+                      formatters={countryTableFormatters}
+                      source="Fonte: Comex Stat/MDIC. Elaboração própria."
+                    />
+                  )}
+                  {exportCountryData.length > 0 && (
+                    <DataTable
+                      title={`Principais Destinos das Exportações (2024) - NCM ${formatNcmCode(ncmCode)}`}
+                      data={exportCountryData}
+                      columns={countryTableColumns}
+                      formatters={countryTableFormatters}
+                      source="Fonte: Comex Stat/MDIC. Elaboração própria."
+                    />
+                  )}
+                </Section>
+              )}
+            </>
           )}
 
-          {sectionVisibility.showRollingSumImportChart && (
-            <Section title="Gráfico de Importação Acumulada (12 Meses)" defaultOpen={true}>
-              {rawMonthlyImportData.length > 0 && !monthlyApiDataIssue ? (
-                <SimpleBarChart
-                  data={chartDataForRollingSumKg} 
-                  xAxisKey="name" 
-                  dataKey="rollingKG" 
-                  title={`Importação Acumulada (KG) nos Últimos 12 Meses - NCM ${formatNcmCode(ncmCode!)}`}
-                  yAxisLabel="Quantidade Acumulada (KG)"
-                  fillColor="steelblue"
-                  customTooltip={<RollingSumTooltip />}
-                  showLegend={false}
+          {sectionVisibility.showExcelAnalysis && (
+            <Section title="Análise de Arquivos Excel (Upload)" defaultOpen={!ncmCode}>
+              <div className="grid md:grid-cols-2 gap-6 mb-6 p-4 border rounded-md bg-gray-50">
+                <FileUpload
+                  label="Arquivo CGIM/DINTE (NCMs-CGIM-DINTE.xlsx)"
+                  onFileUpload={(file) => handleCgimFileUpload(file, ncmCode)}
+                  acceptedFileTypes=".xlsx,.xls"
+                  loading={loading && loadingMessage.includes('CGIM')}
+                  fileName={cgimFile?.name}
                 />
-              ) : monthlyApiDataIssue ? (
-                <div className="p-4 bg-orange-50 border border-orange-200 rounded-md text-center">
-                  <p className="text-orange-700 font-semibold text-lg">
-                    Não foi possível gerar o gráfico de importação acumulada.
-                  </p>
-                  <p className="text-gray-600 mt-2">
-                    A API Comex Stat não retornou dados mensais válidos para o NCM <span className="font-mono bg-gray-200 px-1 rounded">{formatNcmCode(ncmCode!)}</span>.
-                  </p>
-                </div>
-              ) : ( // Case when rawMonthlyImportData is empty but no API issue flagged (e.g., before first load or if section enabled late)
-                 <SimpleBarChart 
-                    data={[]} 
-                    xAxisKey="name" 
-                    dataKey="rollingKG" 
-                    title={`Importação Acumulada (KG) nos Últimos 12 Meses - NCM ${formatNcmCode(ncmCode!)}`}
-                  />
+                <FileUpload
+                  label="Arquivo NFE (dados_nfe_2016_2023.xlsx)"
+                  onFileUpload={(file) => handleNfeFileUpload(file, ncmCode)}
+                  acceptedFileTypes=".xlsx,.xls"
+                  loading={loading && loadingMessage.includes('NFE')}
+                  fileName={nfeFile?.name}
+                />
+              </div>
+
+              {ncmCode && !loading && (
+                <>
+                  {cgimFile && parsedCgimData && (
+                    <DataTable
+                      title={`Informações CGIM/DINTE para NCM ${formatNcmCode(ncmCode)}`}
+                      data={[parsedCgimData]}
+                      columns={cgimNcmInfoColumns}
+                      source="Fonte: Arquivo 20241011_NCMs-CGIM-DINTE.xlsx"
+                    />
+                  )}
+                  {cgimFile && parsedCgimData === null && sectionVisibility.showExcelAnalysis && (
+                    <p className="text-gray-600 p-3">
+                      Nenhuma informação CGIM/DINTE encontrada para NCM {formatNcmCode(ncmCode)} no arquivo fornecido.
+                    </p>
+                  )}
+
+                  {cgimFile && parsedEntityContacts.length > 0 && (
+                    <DataTable
+                      title={`Contatos de Entidades para NCM ${formatNcmCode(ncmCode)}`}
+                      data={parsedEntityContacts}
+                      columns={entityContactsColumns}
+                      source="Fonte: Arquivo 20241011_NCMs-CGIM-DINTE.xlsx"
+                    />
+                  )}
+                  {cgimFile && parsedEntityContacts.length === 0 && parsedCgimData !== undefined && sectionVisibility.showExcelAnalysis && (
+                    <p className="text-gray-600 p-3">
+                      Nenhum contato de entidade encontrado para NCM {formatNcmCode(ncmCode)} no arquivo fornecido.
+                    </p>
+                  )}
+
+                  {nfeFile && parsedNfeDataForNcm.length > 0 && (
+                    <>
+                      <DataTable
+                        title={`Dados Completos NFE para NCM ${formatNcmCode(ncmCode)}`}
+                        data={parsedNfeDataForNcm}
+                        columns={nfeFullDataColumns}
+                        formatters={nfeFullDataFormatters}
+                        source="Fonte: Planilha com dados da nota fiscal da RFB, disponibilizada pela SECEX"
+                      />
+                      <DataTable
+                        title={`Vendas da Indústria Nacional - NCM ${formatNcmCode(ncmCode)}`}
+                        data={nfeSalesTable}
+                        columns={nfeSalesTableColumns}
+                        source="Fonte: Planilha com dados da nota fiscal da RFB, disponibilizada pela SECEX"
+                      />
+                      <DataTable
+                        title={`Consumo Nacional Aparente - NCM ${formatNcmCode(ncmCode)}`}
+                        data={nfeCnaTable}
+                        columns={nfeCnaTableColumns}
+                        source="Fonte: Planilha com dados da nota fiscal da RFB, disponibilizada pela SECEX"
+                      />
+                    </>
+                  )}
+                  {nfeFile && parsedNfeDataForNcm.length === 0 && sectionVisibility.showExcelAnalysis && (
+                    <p className="text-gray-600 p-3">
+                      Nenhum dado NFE encontrado para NCM {formatNcmCode(ncmCode)} no arquivo fornecido.
+                    </p>
+                  )}
+                </>
               )}
             </Section>
           )}
-          
-          {sectionVisibility.showSurgeAnalysis && ncmCode && (
-            <Section title="Análise de Surto de Importação" defaultOpen={true}>
-              <SurgeAnalysisConfigurator 
-                onCalculate={handleCalculateSurge} 
-                isLoading={surgeCalculationLoading}
-                lastUpdateData={lastUpdateData}
-              />
-              <SurgeAnalysisDisplay result={surgeAnalysisResult} isLoading={surgeCalculationLoading} />
-            </Section>
+
+          {showNoDataMessage && (
+            <div className="text-center p-10 bg-white shadow-lg rounded-lg mt-6">
+              <p className="text-xl text-red-500">Nenhum dado encontrado para o NCM {formatNcmCode(ncmCode!)} nas seções selecionadas ou nos arquivos Excel fornecidos (se houver).</p>
+              <p className="text-gray-600 mt-2">Verifique se o código NCM está correto ou tente outro código. Se estiver usando arquivos Excel, certifique-se de que eles contêm dados para o NCM informado e que a seção de análise de Excel está habilitada.</p>
+            </div>
           )}
 
-
-          {sectionVisibility.showCountryData && (importCountryData.length > 0 || exportCountryData.length > 0) && (
-            <Section title="Dados por País (2024)" defaultOpen={false}>
-              {importCountryData.length > 0 && <DataTable title={`Principais Origens das Importações (2024) - NCM ${formatNcmCode(ncmCode)}`} data={importCountryData} columns={countryTableColumns} formatters={countryTableFormatters} source="Fonte: Comex Stat/MDIC. Elaboração própria."/>}
-              {exportCountryData.length > 0 && <DataTable title={`Principais Destinos das Exportações (2024) - NCM ${formatNcmCode(ncmCode)}`} data={exportCountryData} columns={countryTableColumns} formatters={countryTableFormatters} source="Fonte: Comex Stat/MDIC. Elaboração própria."/>}
-            </Section>
-          )}
+          <footer className="mt-12 text-center text-sm text-gray-500 py-4 border-t border-gray-300">
+            <p>© {new Date().getFullYear()} Comexsetor. Desenvolvido como uma ferramenta de frontend.</p>
+            <p>Todos os dados são provenientes da API Comex Stat do MDIC ou de arquivos Excel fornecidos pelo usuário.</p>
+          </footer>
         </>
       )}
-
-      {sectionVisibility.showExcelAnalysis && ( 
-        <Section title="Análise de Arquivos Excel (Upload)" defaultOpen={!ncmCode}>
-            <div className="grid md:grid-cols-2 gap-6 mb-6 p-4 border rounded-md bg-gray-50">
-                <FileUpload 
-                    label="Arquivo CGIM/DINTE (NCMs-CGIM-DINTE.xlsx)" 
-                    onFileUpload={(file) => handleCgimFileUpload(file, ncmCode)} 
-                    acceptedFileTypes=".xlsx,.xls"
-                    loading={loading && loadingMessage.includes('CGIM')}
-                    fileName={cgimFile?.name}
-                />
-                <FileUpload 
-                    label="Arquivo NFE (dados_nfe_2016_2023.xlsx)" 
-                    onFileUpload={(file) => handleNfeFileUpload(file, ncmCode)} 
-                    acceptedFileTypes=".xlsx,.xls"
-                    loading={loading && loadingMessage.includes('NFE')}
-                    fileName={nfeFile?.name}
-                />
-            </div>
-
-            {ncmCode && !loading && ( 
-              <>
-                {cgimFile && parsedCgimData && (
-                    <DataTable title={`Informações CGIM/DINTE para NCM ${formatNcmCode(ncmCode)}`} data={[parsedCgimData]} columns={cgimNcmInfoColumns} source="Fonte: Arquivo 20241011_NCMs-CGIM-DINTE.xlsx"/>
-                )}
-                {cgimFile && parsedCgimData === null && sectionVisibility.showExcelAnalysis && ( 
-                     <p className="text-gray-600 p-3">Nenhuma informação CGIM/DINTE encontrada para NCM {formatNcmCode(ncmCode)} no arquivo fornecido.</p>
-                )}
-
-                {cgimFile && parsedEntityContacts.length > 0 && (
-                     <DataTable title={`Contatos de Entidades para NCM ${formatNcmCode(ncmCode)}`} data={parsedEntityContacts} columns={entityContactsColumns} source="Fonte: Arquivo 20241011_NCMs-CGIM-DINTE.xlsx"/>
-                )}
-                 {cgimFile && parsedEntityContacts.length === 0 && parsedCgimData !== undefined && sectionVisibility.showExcelAnalysis && ( 
-                     <p className="text-gray-600 p-3">Nenhum contato de entidade encontrado para NCM {formatNcmCode(ncmCode)} no arquivo fornecido.</p>
-                )}
-
-                {nfeFile && parsedNfeDataForNcm.length > 0 && (
-                    <>
-                        <DataTable title={`Dados Completos NFE para NCM ${formatNcmCode(ncmCode)}`} data={parsedNfeDataForNcm} columns={nfeFullDataColumns} formatters={nfeFullDataFormatters} source="Fonte: Planilha com dados da nota fiscal da RFB, disponibilizada pela SECEX"/>
-                        <DataTable title={`Vendas da Indústria Nacional - NCM ${formatNcmCode(ncmCode)}`} data={nfeSalesTable} columns={nfeSalesTableColumns} source="Fonte: Planilha com dados da nota fiscal da RFB, disponibilizada pela SECEX"/>
-                        <DataTable title={`Consumo Nacional Aparente - NCM ${formatNcmCode(ncmCode)}`} data={nfeCnaTable} columns={nfeCnaTableColumns} source="Fonte: Planilha com dados da nota fiscal da RFB, disponibilizada pela SECEX"/>
-                    </>
-                )}
-                {nfeFile && parsedNfeDataForNcm.length === 0 && sectionVisibility.showExcelAnalysis && (
-                     <p className="text-gray-600 p-3">Nenhum dado NFE encontrado para NCM {formatNcmCode(ncmCode)} no arquivo fornecido.</p>
-                )}
-              </>
-            )}
-        </Section>
-      )}
-      
-      {showNoDataMessage && (
-         <div className="text-center p-10 bg-white shadow-lg rounded-lg mt-6">
-          <p className="text-xl text-red-500">Nenhum dado encontrado para o NCM {formatNcmCode(ncmCode!)} nas seções selecionadas ou nos arquivos Excel fornecidos (se houver).</p>
-          <p className="text-gray-600 mt-2">Verifique se o código NCM está correto ou tente outro código. Se estiver usando arquivos Excel, certifique-se de que eles contêm dados para o NCM informado e que a seção de análise de Excel está habilitada.</p>
-        </div>
-      )}
-
-      <footer className="mt-12 text-center text-sm text-gray-500 py-4 border-t border-gray-300">
-        <p>© {new Date().getFullYear()} Comex Stat NCM Analyzer. Desenvolvido como uma ferramenta de frontend.</p>
-        <p>Todos os dados são provenientes da API Comex Stat do MDIC ou de arquivos Excel fornecidos pelo usuário.</p>
-      </footer>
     </div>
   );
 };
