@@ -7,18 +7,20 @@ import {
   listCategories,
   listSubcategories,
   type DetailLevel,
-  type DictionaryRow,
   type HierarchyNode,
 } from "../utils/cgimAggregation";
 
-// Seus services reais:
 import * as cgimDictionaryService from "../services/cgimDictionaryService";
 import { fetchAnnualBasketByNcm, type CgimAnnualBasketRow } from "../services/cgimBasketComexService";
 
+type DictionaryRow = {
+  ncm: string;
+  categoria: string;
+  subcategoria: string | null;
+};
+
 type SortKey = "fob" | "kg";
 type SortDir = "asc" | "desc";
-
-// O seu FlowType real (pelo service): "import" | "export"
 type FlowType = "import" | "export";
 
 function formatMoneyUS(v: number): string {
@@ -38,32 +40,52 @@ function pickFn<T extends Function>(obj: any, names: string[]): T {
     const fn = obj?.[n];
     if (typeof fn === "function") return fn as T;
   }
-  throw new Error(
-    `Não encontrei função no cgimDictionaryService. Exporte uma destas: ${names.join(", ")}`
-  );
+  throw new Error(`Não encontrei função no cgimDictionaryService. Exporte uma destas: ${names.join(", ")}`);
+}
+
+function truncateLabel(s: string, max = 70) {
+  const t = String(s ?? "");
+  return t.length > max ? t.slice(0, max - 1) + "…" : t;
+}
+
+// ✅ Trata valores "vazios" de subcategoria (inclui 0)
+function isEmptySubValue(v: unknown): boolean {
+  if (v === null || v === undefined) return true;
+  if (typeof v === "number") return v === 0;
+  const s = String(v).trim();
+  return s === "" || s === "0";
+}
+
+// ✅ Monta um label de subcategoria com profundidade, ignorando "0"
+function buildSubcategoryLabel(subs: Array<string | null>, depth: number): string | null {
+  const parts = subs
+    .slice(0, depth)
+    .map((s) => (isEmptySubValue(s) ? "" : String(s ?? "").trim()))
+    .filter(Boolean);
+
+  if (!parts.length) return null;
+  return parts.join(" > ");
 }
 
 export default function CgimAnalyticsPage() {
-  // Controles principais
   const [entity, setEntity] = React.useState<string>("IABR");
   const [year, setYear] = React.useState<number>(2024);
   const [flow, setFlow] = React.useState<FlowType>("import");
 
-  // Nível de detalhe
   const [detailLevel, setDetailLevel] = React.useState<DetailLevel>("SUBCATEGORY");
 
-  // Ordenação
+  // ✅ profundidade do caminho de subcategoria
+  const [subcatDepth, setSubcatDepth] = React.useState<number>(1);
+  const [maxSubcatDepth, setMaxSubcatDepth] = React.useState<number>(1);
+
   const [sortKey, setSortKey] = React.useState<SortKey>("fob");
   const [sortDir, setSortDir] = React.useState<SortDir>("desc");
 
-  // Expand/Collapse
   const [expandedIds, setExpandedIds] = React.useState<Set<string>>(new Set());
 
-  // Filtros
   const [selectedCategories, setSelectedCategories] = React.useState<string[]>([]);
   const [selectedSubcategories, setSelectedSubcategories] = React.useState<string[]>([]);
 
-  // Dados e estado
   const [loading, setLoading] = React.useState(false);
   const [progress, setProgress] = React.useState<{ done: number; total: number } | null>(null);
   const [error, setError] = React.useState<string | null>(null);
@@ -71,42 +93,95 @@ export default function CgimAnalyticsPage() {
   const [tree, setTree] = React.useState<HierarchyNode[]>([]);
   const [lastUpdated, setLastUpdated] = React.useState<Date | null>(null);
 
-  // Lista fixa de entidades/anos (você pode trocar depois por algo dinâmico)
-  const entities = React.useMemo(() => ["IABR", "ABIVIDRO", "ABAL", "IBÁ"], []);
+  // ✅ entidades do Excel; fallback inicial (até carregar pack)
+  const [entities, setEntities] = React.useState<string[]>(["IABR", "ABIVIDRO", "ABAL", "IBÁ"]);
   const years = React.useMemo(() => [2022, 2023, 2024, 2025], []);
 
-  // Resolve a função real do dicionário (sem “chute” de nome fixo)
+  const [diagnostics, setDiagnostics] = React.useState<{
+    dictRows: number;
+    distinctNcms: number;
+    missingCategoria: number;
+    missingSubcategoria: number;
+    comexRows: number;
+    comexZeroRows: number;
+    unmappedNcms: number;
+    apiLikelyDown: boolean;
+    maxDepth: number;
+  } | null>(null);
+
   const loadDictionary = React.useMemo(() => {
-    return pickFn<(entity: string) => Promise<DictionaryRow[]>>(
+    return pickFn<(entity: string) => Promise<cgimDictionaryService.CgimDictEntry[]>>(
       cgimDictionaryService,
-      [
-        "loadCgimDictionaryForEntity",
-        "loadDictionaryForEntity",
-        "getCgimDictionaryForEntity",
-        "getDictionaryForEntity",
-      ]
+      ["loadCgimDictionaryForEntity", "loadDictionaryForEntity", "getCgimDictionaryForEntity", "getDictionaryForEntity"]
     );
   }, []);
 
-  // Carregamento principal (dict -> ncms -> comex -> árvore)
+  // ✅ Carrega entidades do Excel (pack)
+  React.useEffect(() => {
+    let cancelled = false;
+    async function loadEntitiesFromExcel() {
+      try {
+        const pack = await cgimDictionaryService.loadCgimDictionaryFromExcel();
+        if (cancelled) return;
+
+        const list = (pack.entities ?? []).filter(Boolean);
+        if (list.length) {
+          setEntities(list);
+          if (!list.includes(entity)) setEntity(list[0]);
+        }
+      } catch (e) {
+        console.warn("Falha ao carregar entidades do Excel. Mantendo lista padrão.", e);
+      }
+    }
+    loadEntitiesFromExcel();
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // ✅ Carregamento principal
   React.useEffect(() => {
     let cancelled = false;
 
     async function run() {
-      setLoading(true);
+      // ✅ FIX PRINCIPAL: limpa estado imediatamente ao iniciar nova carga
+      setTree([]);
+      setExpandedIds(new Set());
+      setDiagnostics(null);
       setError(null);
+      setLastUpdated(null);
+
+      setLoading(true);
       setProgress(null);
 
       try {
-        // 1) Dicionário da entidade
-        const dictRows = await loadDictionary(entity);
+        const dictEntries = await loadDictionary(entity);
 
-        // 2) Extrai NCMs da cesta (8 dígitos)
-        const ncms = Array.from(
-          new Set(dictRows.map((r) => normalizeNcm((r as any).ncm)).filter(Boolean))
-        );
+        const maxDepthFound =
+          dictEntries.reduce((acc, e) => {
+            const depth = (e.subcategorias ?? []).filter((x) => !isEmptySubValue(x)).length;
+            return Math.max(acc, depth);
+          }, 0) || 1;
 
-        // 3) Busca Comex por chunks (o seu service já faz cache e concorrência)
+        setMaxSubcatDepth(maxDepthFound);
+
+        const effectiveDepth = Math.min(subcatDepth, maxDepthFound || 1);
+        if (effectiveDepth !== subcatDepth) setSubcatDepth(effectiveDepth);
+
+        const dictRows: DictionaryRow[] = (dictEntries ?? []).map((e) => {
+          const categoria = String(e.categoria ?? "").trim();
+          const subLabel = buildSubcategoryLabel(e.subcategorias ?? [], effectiveDepth);
+
+          return {
+            ncm: e.ncm,
+            categoria: categoria || "Sem categoria (mapeamento incompleto)",
+            subcategoria: subLabel,
+          };
+        });
+
+        const ncms = Array.from(new Set(dictRows.map((r) => normalizeNcm(r.ncm)).filter(Boolean)));
+
         const basketRows: CgimAnnualBasketRow[] = await fetchAnnualBasketByNcm({
           entity,
           year: String(year),
@@ -121,34 +196,49 @@ export default function CgimAnalyticsPage() {
 
         if (cancelled) return;
 
-        // 4) Converte {fob,kg} -> {metricFOB, metricKG} (formato esperado pelo agregador)
         const comexRows = basketRows.map((r) => ({
           ncm: r.ncm,
           metricFOB: r.fob,
           metricKG: r.kg,
         }));
 
-        // 5) Build da árvore
+        const dictNcmSet = new Set(dictRows.map((d) => normalizeNcm(d.ncm)).filter(Boolean));
+        const unmappedNcms = comexRows.filter((r) => !dictNcmSet.has(normalizeNcm(r.ncm))).length;
+
+        const comexZeroRows = comexRows.filter(
+          (r) => (Number(r.metricFOB) || 0) === 0 && (Number(r.metricKG) || 0) === 0
+        ).length;
+
+        const missingCategoria = dictRows.filter(
+          (d) => !String(d.categoria ?? "").trim() || String(d.categoria).includes("Sem categoria")
+        ).length;
+
+        const missingSubcategoria = dictRows.filter((d) => !String(d.subcategoria ?? "").trim()).length;
+
+        const apiLikelyDown = comexRows.length > 0 && comexZeroRows === comexRows.length;
+
+        setDiagnostics({
+          dictRows: dictRows.length,
+          distinctNcms: ncms.length,
+          missingCategoria,
+          missingSubcategoria,
+          comexRows: comexRows.length,
+          comexZeroRows,
+          unmappedNcms,
+          apiLikelyDown,
+          maxDepth: maxDepthFound,
+        });
+
         const nextTree = buildHierarchyTree({
           dictRows,
           comexRows,
           includeUnmapped: true,
+          includeAllZero: apiLikelyDown,
         });
 
         setTree(nextTree);
         setLastUpdated(new Date());
-
-        // começa recolhido (UX melhor)
         setExpandedIds(new Set());
-
-        // saneia filtros antigos
-        const availableCats = new Set(listCategories(nextTree));
-        const nextSelectedCats = selectedCategories.filter((c) => availableCats.has(c));
-        setSelectedCategories(nextSelectedCats);
-
-        const availableSubs = new Set(listSubcategories(nextTree, nextSelectedCats));
-        const nextSelectedSubs = selectedSubcategories.filter((s) => availableSubs.has(s));
-        setSelectedSubcategories(nextSelectedSubs);
       } catch (e: any) {
         if (cancelled) return;
         setError(e?.message ? String(e.message) : "Erro ao carregar dados.");
@@ -165,38 +255,15 @@ export default function CgimAnalyticsPage() {
       cancelled = true;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [entity, year, flow]);
+  }, [entity, year, flow, subcatDepth]);
 
-  // Derivados para filtros
   const availableCategories = React.useMemo(() => listCategories(tree), [tree]);
   const availableSubcategories = React.useMemo(
     () => listSubcategories(tree, selectedCategories),
     [tree, selectedCategories]
   );
 
-  // Totais
   const total = React.useMemo(() => computeTotal(tree), [tree]);
-
-  // Ações
-  const onToggleExpand = React.useCallback((id: string) => {
-    setExpandedIds((prev) => {
-      const next = new Set(prev);
-      if (next.has(id)) next.delete(id);
-      else next.add(id);
-      return next;
-    });
-  }, []);
-
-  const onChangeSort = React.useCallback((k: SortKey) => {
-    setSortKey((prevKey) => {
-      if (prevKey !== k) {
-        setSortDir("desc");
-        return k;
-      }
-      setSortDir((d) => (d === "desc" ? "asc" : "desc"));
-      return prevKey;
-    });
-  }, []);
 
   const expandAll = React.useCallback(() => {
     const ids = new Set<string>();
@@ -215,7 +282,6 @@ export default function CgimAnalyticsPage() {
     setSelectedSubcategories([]);
   }, []);
 
-  // Layout simples
   const cardStyle: React.CSSProperties = {
     border: "1px solid #e6e6e6",
     borderRadius: 12,
@@ -223,8 +289,16 @@ export default function CgimAnalyticsPage() {
     background: "#fff",
   };
   const labelStyle: React.CSSProperties = { fontSize: 12, opacity: 0.7, marginBottom: 6 };
-  const controlRow: React.CSSProperties = { display: "grid", gridTemplateColumns: "1fr 1fr 1fr 1fr", gap: 12 };
-  const controlRow2: React.CSSProperties = { display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 12 };
+  const controlRow: React.CSSProperties = {
+    display: "grid",
+    gridTemplateColumns: "1fr 1fr 1fr 1fr",
+    gap: 12,
+  };
+  const controlRow2: React.CSSProperties = {
+    display: "grid",
+    gridTemplateColumns: "1fr 1fr 1fr",
+    gap: 12,
+  };
 
   return (
     <div style={{ padding: 18, display: "flex", flexDirection: "column", gap: 14 }}>
@@ -246,11 +320,24 @@ export default function CgimAnalyticsPage() {
             <div style={labelStyle}>Entidade</div>
             <select
               value={entity}
-              onChange={(e) => setEntity(e.target.value)}
+              onChange={(e) => {
+                // ✅ FIX: limpa filtros e UI imediatamente ao trocar entidade
+                setSelectedCategories([]);
+                setSelectedSubcategories([]);
+                setExpandedIds(new Set());
+                setTree([]);
+                setDiagnostics(null);
+                setError(null);
+                setLastUpdated(null);
+
+                setEntity(e.target.value);
+              }}
               style={{ width: "100%", padding: 10, borderRadius: 10, border: "1px solid #ddd" }}
             >
               {entities.map((en) => (
-                <option key={en} value={en}>{en}</option>
+                <option key={en} value={en}>
+                  {en}
+                </option>
               ))}
             </select>
           </div>
@@ -263,7 +350,9 @@ export default function CgimAnalyticsPage() {
               style={{ width: "100%", padding: 10, borderRadius: 10, border: "1px solid #ddd" }}
             >
               {years.map((y) => (
-                <option key={y} value={y}>{y}</option>
+                <option key={y} value={y}>
+                  {y}
+                </option>
               ))}
             </select>
           </div>
@@ -291,6 +380,30 @@ export default function CgimAnalyticsPage() {
               <option value="SUBCATEGORY">Categoria + Subcategoria</option>
               <option value="NCM">Até NCM</option>
             </select>
+
+            {detailLevel !== "CATEGORY" && (
+              <div style={{ marginTop: 10 }}>
+                <div style={labelStyle}>Profundidade da Subcategoria</div>
+                <select
+                  value={subcatDepth}
+                  onChange={(e) => {
+                    setSelectedSubcategories([]);
+                    setSubcatDepth(Number(e.target.value));
+                  }}
+                  style={{ width: "100%", padding: 10, borderRadius: 10, border: "1px solid #ddd" }}
+                >
+                  {Array.from({ length: Math.max(1, maxSubcatDepth) }, (_, i) => i + 1).map((d) => (
+                    <option key={d} value={d}>
+                      {d === 1 ? "Subcategoria (1)" : `Subcategoria (1…${d})`}
+                    </option>
+                  ))}
+                </select>
+
+                <div style={{ fontSize: 12, opacity: 0.65, marginTop: 6 }}>
+                  Máximo nesta entidade: {maxSubcatDepth}
+                </div>
+              </div>
+            )}
           </div>
         </div>
 
@@ -310,7 +423,9 @@ export default function CgimAnalyticsPage() {
               style={{ width: "100%", padding: 10, borderRadius: 10, border: "1px solid #ddd", minHeight: 120 }}
             >
               {availableCategories.map((c) => (
-                <option key={c} value={c}>{c}</option>
+                <option key={c} value={c}>
+                  {c}
+                </option>
               ))}
             </select>
             <div style={{ fontSize: 12, opacity: 0.65, marginTop: 6 }}>
@@ -330,7 +445,9 @@ export default function CgimAnalyticsPage() {
               style={{ width: "100%", padding: 10, borderRadius: 10, border: "1px solid #ddd", minHeight: 120 }}
             >
               {availableSubcategories.map((s) => (
-                <option key={s} value={s}>{s}</option>
+                <option key={s} value={s} title={s}>
+                  {truncateLabel(s, 72)}
+                </option>
               ))}
             </select>
             <div style={{ fontSize: 12, opacity: 0.65, marginTop: 6 }}>
@@ -343,22 +460,40 @@ export default function CgimAnalyticsPage() {
               <div style={labelStyle}>Ações</div>
               <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
                 <button
-                  onClick={expandAll}
+                  onClick={() => expandAll()}
                   disabled={!tree.length}
-                  style={{ padding: "10px 12px", borderRadius: 10, border: "1px solid #ddd", background: "#fff", cursor: "pointer" }}
+                  style={{
+                    padding: "10px 12px",
+                    borderRadius: 10,
+                    border: "1px solid #ddd",
+                    background: "#fff",
+                    cursor: "pointer",
+                  }}
                 >
                   Expandir tudo
                 </button>
                 <button
-                  onClick={collapseAll}
+                  onClick={() => collapseAll()}
                   disabled={!tree.length}
-                  style={{ padding: "10px 12px", borderRadius: 10, border: "1px solid #ddd", background: "#fff", cursor: "pointer" }}
+                  style={{
+                    padding: "10px 12px",
+                    borderRadius: 10,
+                    border: "1px solid #ddd",
+                    background: "#fff",
+                    cursor: "pointer",
+                  }}
                 >
                   Recolher tudo
                 </button>
                 <button
-                  onClick={resetFilters}
-                  style={{ padding: "10px 12px", borderRadius: 10, border: "1px solid #ddd", background: "#fff", cursor: "pointer" }}
+                  onClick={() => resetFilters()}
+                  style={{
+                    padding: "10px 12px",
+                    borderRadius: 10,
+                    border: "1px solid #ddd",
+                    background: "#fff",
+                    cursor: "pointer",
+                  }}
                 >
                   Limpar filtros
                 </button>
@@ -370,17 +505,35 @@ export default function CgimAnalyticsPage() {
               <div style={{ fontSize: 18, fontWeight: 800, marginTop: 4 }}>
                 FOB: {formatMoneyUS(total.fob)}
               </div>
-              <div style={{ fontSize: 14, opacity: 0.85 }}>
-                KG: {formatKg(total.kg)}
-              </div>
+              <div style={{ fontSize: 14, opacity: 0.85 }}>KG: {formatKg(total.kg)}</div>
+
+              {diagnostics && (
+                <div style={{ marginTop: 12, paddingTop: 10, borderTop: "1px dashed #eee", fontSize: 12, opacity: 0.9 }}>
+                  <div style={{ fontWeight: 800, marginBottom: 6 }}>Diagnóstico (rápido)</div>
+                  <div>
+                    Dicionário: {diagnostics.dictRows} linhas • {diagnostics.distinctNcms} NCMs únicos
+                  </div>
+                  <div>Sem categoria (no dicionário): {diagnostics.missingCategoria}</div>
+                  <div>Sem subcategoria (no dicionário): {diagnostics.missingSubcategoria}</div>
+                  <div>Máx. profundidade subcat: {diagnostics.maxDepth}</div>
+                  <div>
+                    Comex: {diagnostics.comexRows} NCMs • Zeradas (FOB=0 e KG=0): {diagnostics.comexZeroRows}
+                  </div>
+                  <div>Não mapeadas (comex x dicionário): {diagnostics.unmappedNcms}</div>
+                  {diagnostics.apiLikelyDown && (
+                    <div style={{ marginTop: 6, opacity: 0.85 }}>
+                      ⚠️ Parece que a API do ComexStat falhou (tudo zerou). Mostrando estrutura do dicionário com zeros.
+                    </div>
+                  )}
+                </div>
+              )}
             </div>
           </div>
         </div>
 
         {loading && (
           <div style={{ marginTop: 12, fontSize: 13, opacity: 0.75 }}>
-            Carregando dados…
-            {progress ? ` (${progress.done}/${progress.total} chunks)` : ""}
+            Carregando dados… {progress ? `(${progress.done}/${progress.total} chunks)` : ""}
           </div>
         )}
 

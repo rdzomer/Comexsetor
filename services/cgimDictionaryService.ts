@@ -1,28 +1,15 @@
 // services/cgimDictionaryService.ts
 import * as XLSX from "xlsx";
 
-/**
- * Este service fornece DUAS APIs:
- *
- * A) API "nova" (por entidade) - mantendo compatibilidade com o que já existe no seu app:
- *    - loadCgimDictionaryForEntity(entity)
- *    - loadDictionaryForEntity(entity)
- *    - getCgimDictionaryForEntity(entity)
- *    - getDictionaryForEntity(entity)
- *
- * B) API "antiga/compat" usada pelo seu CgimAnalyticsPage.tsx bonito:
- *    - loadCgimDictionaryFromExcel() -> { entities, entriesByEntity }
- */
-
 export interface CgimDictEntry {
-  ncm: string; // 8 dígitos
-  categoria: string | null;
-  subcategorias: Array<string | null>;
+  ncm: string;
+  categoria: string | null; // SOMENTE COLUNA "Categoria" (M)
+  subcategorias: Array<string | null>; // N/O/P/Q (quando existir)
   source?: {
     fileName?: string;
     sheetName?: string;
-    rowNumber?: number; // 1-based
-    headerRow?: number; // 1-based
+    rowNumber?: number;
+    headerRow?: number;
   };
 }
 
@@ -39,17 +26,13 @@ export interface CgimDictionaryPack {
 }
 
 export interface LoadCgimDictionaryOptions {
-  publicPath?: string; // default: "/dictionaries/cgim_dinte.xlsx"
-  cacheKey?: string;   // default: "cgim:dict:excel:v1"
-  sheetWhitelist?: string[]; // opcional
+  publicPath?: string;
+  cacheKey?: string;
+  sheetWhitelist?: string[];
 }
 
 const DEFAULT_PUBLIC_PATH = "/dictionaries/cgim_dinte.xlsx";
-const DEFAULT_CACHE_KEY = "cgim:dict:excel:v1";
-
-// ------------------------------------------------------------
-// Helpers
-// ------------------------------------------------------------
+const DEFAULT_CACHE_KEY = "cgim:dict:excel:v4"; // bump pra limpar cache antigo
 
 function normHeader(s: unknown): string {
   return String(s ?? "")
@@ -66,13 +49,40 @@ function normalizeNcmTo8(raw: unknown): string | null {
   return padded.length === 8 ? padded : null;
 }
 
+// ✅ trata 0 como vazio (0 ou "0" ou "0,0" etc.)
 function safeStr(v: unknown): string {
-  const s = String(v ?? "").trim();
-  return s.length ? s : "";
+  if (v === null || v === undefined) return "";
+  if (typeof v === "number") {
+    if (v === 0) return "";
+    return String(v).trim();
+  }
+  const s = String(v).trim();
+  if (!s) return "";
+  // se vier "0" (muito comum nessas colunas), ignora
+  if (s === "0") return "";
+  return s;
 }
 
+/**
+ * Detecta a linha de cabeçalho procurando uma linha que contenha:
+ * - NCM
+ * - Categoria
+ * (isso evita pegar linhas intermediárias ou cabeçalhos incompletos)
+ */
 function detectHeaderRow(rows: any[][]): number {
-  for (let i = 0; i < Math.min(rows.length, 30); i++) {
+  const maxScan = Math.min(rows.length, 80);
+  for (let i = 0; i < maxScan; i++) {
+    const line = rows[i] ?? [];
+    const headers = line.map(normHeader);
+
+    const hasNcm = headers.some((h) => h === "ncm" || h.includes("ncm"));
+    const hasCategoria = headers.some((h) => h === "categoria");
+
+    if (hasNcm && hasCategoria) return i;
+  }
+
+  // fallback antigo: se não achar ambos, procura só NCM
+  for (let i = 0; i < maxScan; i++) {
     const line = rows[i] ?? [];
     const hasNcm = line.some((cell) => {
       const h = normHeader(cell);
@@ -80,6 +90,7 @@ function detectHeaderRow(rows: any[][]): number {
     });
     if (hasNcm) return i;
   }
+
   return 0;
 }
 
@@ -99,21 +110,20 @@ function guessColumns(rows: any[][], headerRowIdx: number) {
 
   if (ncmCol === null) throw new Error("cgimDictionaryService: não consegui achar coluna NCM.");
 
-  // Categoria: prioriza "categoria", depois "setor", depois "segmento"
-  const categoriaCol =
-    findIdx((h) => h === "categoria") ??
-    findIdx((h) => h === "setor") ??
-    findIdx((h) => h === "segmento") ??
-    null;
+  // ✅ Categoria = SOMENTE "categoria" (coluna M)
+  const categoriaCol = findIdx((h) => h === "categoria") ?? null;
 
-  // Subcategoria: prioriza "subcategoria" / "subsegmento", fallback "segmento"
-  const subcategoriaCol =
-    findIdx((h) => h === "subcategoria" || h.includes("sub categoria") || h.includes("sub-categoria")) ??
-    findIdx((h) => h === "subsegmento") ??
-    findIdx((h) => h === "segmento") ??
-    null;
+  // Subcategorias (1..n): "subcategoria (1)", "subcategoria (2)" etc.
+  const subcategoriaCols: number[] = [];
+  for (let i = 0; i < norm.length; i++) {
+    const h = norm[i];
+    if (!h) continue;
+    if (h === "subcategoria" || h.startsWith("subcategoria")) {
+      subcategoriaCols.push(i);
+    }
+  }
 
-  return { ncmCol, categoriaCol, subcategoriaCol, headerRowIdx };
+  return { ncmCol, categoriaCol, subcategoriaCols, headerRowIdx };
 }
 
 function firstNonEmpty(arr?: Array<string | null | undefined>): string | null {
@@ -125,17 +135,12 @@ function firstNonEmpty(arr?: Array<string | null | undefined>): string | null {
   return null;
 }
 
-// ------------------------------------------------------------
-// API B (compat) - usada pelo CgimAnalyticsPage.tsx "bonito"
-// ------------------------------------------------------------
-
 export async function loadCgimDictionaryFromExcel(
   options: LoadCgimDictionaryOptions = {}
 ): Promise<CgimDictionaryPack> {
   const publicPath = options.publicPath ?? DEFAULT_PUBLIC_PATH;
   const cacheKey = options.cacheKey ?? DEFAULT_CACHE_KEY;
 
-  // cache
   const cached = localStorage.getItem(cacheKey);
   if (cached) {
     try {
@@ -151,18 +156,9 @@ export async function loadCgimDictionaryFromExcel(
   const buf = await res.arrayBuffer();
 
   const wb = XLSX.read(buf, { type: "array" });
-
   const allSheets = wb.SheetNames ?? [];
 
-  // costuma existir uma aba "master" tipo "NCMs-CGIM-DINTE" — excluímos
-  const masterNames = new Set([
-    "NCMs-CGIM-DINTE",
-    "NCMs-CGIM",
-    "DICIONARIO",
-    "DICIONÁRIO",
-    "MASTER",
-  ]);
-
+  const masterNames = new Set(["NCMs-CGIM-DINTE", "NCMs-CGIM", "DICIONARIO", "DICIONÁRIO", "MASTER"]);
   const entitySheets = allSheets.filter((s) => !masterNames.has(s));
 
   const sheetsToRead = options.sheetWhitelist?.length
@@ -191,29 +187,27 @@ export async function loadCgimDictionaryFromExcel(
       const ncm = normalizeNcmTo8(ncmRaw);
 
       const categoriaRaw = cols.categoriaCol !== null ? safeStr(line[cols.categoriaCol]) : "";
-      const subRaw = cols.subcategoriaCol !== null ? safeStr(line[cols.subcategoriaCol]) : "";
+
+      const subcategorias: Array<string | null> = (cols.subcategoriaCols ?? []).map((cIdx) => {
+        const v = safeStr(line[cIdx]); // ✅ já remove 0
+        return v ? v : null;
+      });
+
+      const subFirst = firstNonEmpty(subcategorias) ?? "";
 
       // descarta linha totalmente vazia
-      if (!safeStr(ncmRaw) && !categoriaRaw && !subRaw) continue;
+      if (!safeStr(ncmRaw) && !categoriaRaw && !subFirst) continue;
 
       if (!ncm) {
         invalidNcmRows++;
         continue;
       }
 
-      const categoria = categoriaRaw ? categoriaRaw : null;
-      const subcategorias: Array<string | null> = [subRaw ? subRaw : null];
-
       out.push({
         ncm,
-        categoria,
+        categoria: categoriaRaw ? categoriaRaw : null,
         subcategorias,
-        source: {
-          fileName: publicPath,
-          sheetName,
-          rowNumber: r + 1,
-          headerRow: headerRowIdx + 1,
-        },
+        source: { fileName: publicPath, sheetName, rowNumber: r + 1, headerRow: headerRowIdx + 1 },
       });
     }
 
@@ -245,12 +239,7 @@ export async function loadCgimDictionaryFromExcel(
   return pack;
 }
 
-// ------------------------------------------------------------
-// API A (por entidade) - mantendo compatibilidade com o que já existe
-// ------------------------------------------------------------
-
 async function loadPackCached(): Promise<CgimDictionaryPack> {
-  // sempre usa a API B como fonte única
   return await loadCgimDictionaryFromExcel();
 }
 
@@ -259,20 +248,11 @@ export async function loadCgimDictionaryForEntity(entity: string): Promise<CgimD
   return pack.entriesByEntity?.[entity] ?? [];
 }
 
-// aliases antigos existentes no seu app (mantidos)
-export async function loadDictionaryForEntity(entity: string): Promise<CgimDictEntry[]> {
-  return await loadCgimDictionaryForEntity(entity);
-}
+// aliases (compat)
+export async function loadDictionaryForEntity(entity: string) { return loadCgimDictionaryForEntity(entity); }
+export async function getCgimDictionaryForEntity(entity: string) { return loadCgimDictionaryForEntity(entity); }
+export async function getDictionaryForEntity(entity: string) { return loadCgimDictionaryForEntity(entity); }
 
-export async function getCgimDictionaryForEntity(entity: string): Promise<CgimDictEntry[]> {
-  return await loadCgimDictionaryForEntity(entity);
-}
-
-export async function getDictionaryForEntity(entity: string): Promise<CgimDictEntry[]> {
-  return await loadCgimDictionaryForEntity(entity);
-}
-
-// util opcional (caso algum lugar precise)
 export function getFirstSubcategory(entry: CgimDictEntry): string | null {
   return firstNonEmpty(entry.subcategorias);
 }
