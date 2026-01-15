@@ -294,9 +294,17 @@ export default function CgimAnalyticsPage() {
     gridTemplateColumns: "1fr 1fr 1fr 1fr",
     gap: 12,
   };
+
+  // ✅ NOVO LAYOUT: 2 colunas (esq: filtros empilhados / dir: ações)
   const controlRow2: React.CSSProperties = {
     display: "grid",
-    gridTemplateColumns: "1fr 1fr 1fr",
+    gridTemplateColumns: "2fr 1fr",
+    gap: 12,
+    alignItems: "start",
+  };
+  const filtersStack: React.CSSProperties = {
+    display: "grid",
+    gridTemplateColumns: "1fr",
     gap: 12,
   };
 
@@ -409,52 +417,59 @@ export default function CgimAnalyticsPage() {
 
         <div style={{ height: 12 }} />
 
+        {/* ✅ NOVO: filtros empilhados (categoria em cima, subcategoria embaixo) */}
         <div style={controlRow2}>
-          <div>
-            <div style={labelStyle}>Filtrar Categorias (multi)</div>
-            <select
-              multiple
-              value={selectedCategories}
-              onChange={(e) => {
-                const values = Array.from(e.target.selectedOptions).map((o) => o.value);
-                setSelectedCategories(values);
-                setSelectedSubcategories([]);
-              }}
-              style={{ width: "100%", padding: 10, borderRadius: 10, border: "1px solid #ddd", minHeight: 120 }}
-            >
-              {availableCategories.map((c) => (
-                <option key={c} value={c}>
-                  {c}
-                </option>
-              ))}
-            </select>
-            <div style={{ fontSize: 12, opacity: 0.65, marginTop: 6 }}>
-              {selectedCategories.length ? `${selectedCategories.length} selecionada(s)` : "Todas"}
+          <div style={filtersStack}>
+            <div>
+              <div style={labelStyle}>Filtrar Categorias (multi)</div>
+              <select
+                multiple
+                value={selectedCategories}
+                onChange={(e) => {
+                  const values = Array.from(e.target.selectedOptions).map((o) => o.value);
+                  setSelectedCategories(values);
+                  setSelectedSubcategories([]);
+                }}
+                style={{ width: "100%", padding: 10, borderRadius: 10, border: "1px solid #ddd", minHeight: 90 }}
+              >
+                {availableCategories.map((c) => (
+                  <option key={c} value={c}>
+                    {c}
+                  </option>
+                ))}
+              </select>
+              <div style={{ fontSize: 12, opacity: 0.65, marginTop: 6 }}>
+                {selectedCategories.length ? `${selectedCategories.length} selecionada(s)` : "Todas"}
+              </div>
+            </div>
+
+            <div>
+              <div style={labelStyle}>Filtrar Subcategorias (multi)</div>
+              <select
+                multiple
+                value={selectedSubcategories}
+                onChange={(e) => {
+                  const values = Array.from(e.target.selectedOptions).map((o) => o.value);
+                  setSelectedSubcategories(values);
+                }}
+                // ✅ Mais alto e com MAIS largura (agora ocupa a coluna inteira)
+                style={{ width: "100%", padding: 10, borderRadius: 10, border: "1px solid #ddd", minHeight: 220 }}
+              >
+                {availableSubcategories.map((s) => (
+                  <option key={s} value={s} title={s}>
+                    {truncateLabel(s, 110)}
+                  </option>
+                ))}
+              </select>
+              <div style={{ fontSize: 12, opacity: 0.65, marginTop: 6 }}>
+                {selectedSubcategories.length
+                  ? `${selectedSubcategories.length} selecionada(s)`
+                  : "Todas (quando existirem)"}
+              </div>
             </div>
           </div>
 
-          <div>
-            <div style={labelStyle}>Filtrar Subcategorias (multi)</div>
-            <select
-              multiple
-              value={selectedSubcategories}
-              onChange={(e) => {
-                const values = Array.from(e.target.selectedOptions).map((o) => o.value);
-                setSelectedSubcategories(values);
-              }}
-              style={{ width: "100%", padding: 10, borderRadius: 10, border: "1px solid #ddd", minHeight: 120 }}
-            >
-              {availableSubcategories.map((s) => (
-                <option key={s} value={s} title={s}>
-                  {truncateLabel(s, 72)}
-                </option>
-              ))}
-            </select>
-            <div style={{ fontSize: 12, opacity: 0.65, marginTop: 6 }}>
-              {selectedSubcategories.length ? `${selectedSubcategories.length} selecionada(s)` : "Todas (quando existirem)"}
-            </div>
-          </div>
-
+          {/* Coluna direita: igual ao seu código */}
           <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
             <div>
               <div style={labelStyle}>Ações</div>
