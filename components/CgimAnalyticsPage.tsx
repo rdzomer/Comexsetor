@@ -289,23 +289,36 @@ export default function CgimAnalyticsPage() {
     background: "#fff",
   };
   const labelStyle: React.CSSProperties = { fontSize: 12, opacity: 0.7, marginBottom: 6 };
+
   const controlRow: React.CSSProperties = {
     display: "grid",
     gridTemplateColumns: "1fr 1fr 1fr 1fr",
     gap: 12,
   };
 
-  // ✅ NOVO LAYOUT: 2 colunas (esq: filtros empilhados / dir: ações)
-  const controlRow2: React.CSSProperties = {
-    display: "grid",
-    gridTemplateColumns: "2fr 1fr",
-    gap: 12,
-    alignItems: "start",
-  };
+  // ✅ NOVO: empilha categorias/subcategorias/ações (subcat fica 100% largura)
   const filtersStack: React.CSSProperties = {
-    display: "grid",
-    gridTemplateColumns: "1fr",
+    display: "flex",
+    flexDirection: "column",
     gap: 12,
+  };
+
+  // ✅ deixa a caixa maior por padrão (você pode ajustar aqui)
+  const selectBoxStyle: React.CSSProperties = {
+    width: "100%",
+    padding: 10,
+    borderRadius: 10,
+    border: "1px solid #ddd",
+  };
+
+  const multiSelectStyleBase: React.CSSProperties = {
+    ...selectBoxStyle,
+    minHeight: 140,
+  };
+
+  const multiSelectSubcatStyle: React.CSSProperties = {
+    ...selectBoxStyle,
+    minHeight: 260, // ✅ mais alto
   };
 
   return (
@@ -340,7 +353,7 @@ export default function CgimAnalyticsPage() {
 
                 setEntity(e.target.value);
               }}
-              style={{ width: "100%", padding: 10, borderRadius: 10, border: "1px solid #ddd" }}
+              style={selectBoxStyle}
             >
               {entities.map((en) => (
                 <option key={en} value={en}>
@@ -355,7 +368,7 @@ export default function CgimAnalyticsPage() {
             <select
               value={year}
               onChange={(e) => setYear(Number(e.target.value))}
-              style={{ width: "100%", padding: 10, borderRadius: 10, border: "1px solid #ddd" }}
+              style={selectBoxStyle}
             >
               {years.map((y) => (
                 <option key={y} value={y}>
@@ -370,7 +383,7 @@ export default function CgimAnalyticsPage() {
             <select
               value={flow}
               onChange={(e) => setFlow(e.target.value as FlowType)}
-              style={{ width: "100%", padding: 10, borderRadius: 10, border: "1px solid #ddd" }}
+              style={selectBoxStyle}
             >
               <option value="import">Importação</option>
               <option value="export">Exportação</option>
@@ -382,7 +395,7 @@ export default function CgimAnalyticsPage() {
             <select
               value={detailLevel}
               onChange={(e) => setDetailLevel(e.target.value as DetailLevel)}
-              style={{ width: "100%", padding: 10, borderRadius: 10, border: "1px solid #ddd" }}
+              style={selectBoxStyle}
             >
               <option value="CATEGORY">Somente Categoria</option>
               <option value="SUBCATEGORY">Categoria + Subcategoria</option>
@@ -398,7 +411,7 @@ export default function CgimAnalyticsPage() {
                     setSelectedSubcategories([]);
                     setSubcatDepth(Number(e.target.value));
                   }}
-                  style={{ width: "100%", padding: 10, borderRadius: 10, border: "1px solid #ddd" }}
+                  style={selectBoxStyle}
                 >
                   {Array.from({ length: Math.max(1, maxSubcatDepth) }, (_, i) => i + 1).map((d) => (
                     <option key={d} value={d}>
@@ -417,59 +430,55 @@ export default function CgimAnalyticsPage() {
 
         <div style={{ height: 12 }} />
 
-        {/* ✅ NOVO: filtros empilhados (categoria em cima, subcategoria embaixo) */}
-        <div style={controlRow2}>
-          <div style={filtersStack}>
-            <div>
-              <div style={labelStyle}>Filtrar Categorias (multi)</div>
-              <select
-                multiple
-                value={selectedCategories}
-                onChange={(e) => {
-                  const values = Array.from(e.target.selectedOptions).map((o) => o.value);
-                  setSelectedCategories(values);
-                  setSelectedSubcategories([]);
-                }}
-                style={{ width: "100%", padding: 10, borderRadius: 10, border: "1px solid #ddd", minHeight: 90 }}
-              >
-                {availableCategories.map((c) => (
-                  <option key={c} value={c}>
-                    {c}
-                  </option>
-                ))}
-              </select>
-              <div style={{ fontSize: 12, opacity: 0.65, marginTop: 6 }}>
-                {selectedCategories.length ? `${selectedCategories.length} selecionada(s)` : "Todas"}
-              </div>
-            </div>
-
-            <div>
-              <div style={labelStyle}>Filtrar Subcategorias (multi)</div>
-              <select
-                multiple
-                value={selectedSubcategories}
-                onChange={(e) => {
-                  const values = Array.from(e.target.selectedOptions).map((o) => o.value);
-                  setSelectedSubcategories(values);
-                }}
-                // ✅ Mais alto e com MAIS largura (agora ocupa a coluna inteira)
-                style={{ width: "100%", padding: 10, borderRadius: 10, border: "1px solid #ddd", minHeight: 220 }}
-              >
-                {availableSubcategories.map((s) => (
-                  <option key={s} value={s} title={s}>
-                    {truncateLabel(s, 110)}
-                  </option>
-                ))}
-              </select>
-              <div style={{ fontSize: 12, opacity: 0.65, marginTop: 6 }}>
-                {selectedSubcategories.length
-                  ? `${selectedSubcategories.length} selecionada(s)`
-                  : "Todas (quando existirem)"}
-              </div>
+        {/* ✅ NOVO LAYOUT: subcategorias ocupam 100% da largura */}
+        <div style={filtersStack}>
+          <div>
+            <div style={labelStyle}>Filtrar Categorias (multi)</div>
+            <select
+              multiple
+              value={selectedCategories}
+              onChange={(e) => {
+                const values = Array.from(e.target.selectedOptions).map((o) => o.value);
+                setSelectedCategories(values);
+                setSelectedSubcategories([]);
+              }}
+              style={multiSelectStyleBase}
+            >
+              {availableCategories.map((c) => (
+                <option key={c} value={c}>
+                  {c}
+                </option>
+              ))}
+            </select>
+            <div style={{ fontSize: 12, opacity: 0.65, marginTop: 6 }}>
+              {selectedCategories.length ? `${selectedCategories.length} selecionada(s)` : "Todas"}
             </div>
           </div>
 
-          {/* Coluna direita: igual ao seu código */}
+          <div>
+            <div style={labelStyle}>Filtrar Subcategorias (multi)</div>
+            <select
+              multiple
+              value={selectedSubcategories}
+              onChange={(e) => {
+                const values = Array.from(e.target.selectedOptions).map((o) => o.value);
+                setSelectedSubcategories(values);
+              }}
+              style={multiSelectSubcatStyle}
+            >
+              {availableSubcategories.map((s) => (
+                <option key={s} value={s} title={s}>
+                  {truncateLabel(s, 140)}
+                </option>
+              ))}
+            </select>
+            <div style={{ fontSize: 12, opacity: 0.65, marginTop: 6 }}>
+              {selectedSubcategories.length
+                ? `${selectedSubcategories.length} selecionada(s)`
+                : "Todas (quando existirem)"}
+            </div>
+          </div>
+
           <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
             <div>
               <div style={labelStyle}>Ações</div>
@@ -515,7 +524,7 @@ export default function CgimAnalyticsPage() {
               </div>
             </div>
 
-            <div style={{ marginTop: "auto", borderTop: "1px solid #eee", paddingTop: 12 }}>
+            <div style={{ borderTop: "1px solid #eee", paddingTop: 12 }}>
               <div style={{ fontSize: 12, opacity: 0.7 }}>Total (cesta anual)</div>
               <div style={{ fontSize: 18, fontWeight: 800, marginTop: 4 }}>
                 FOB: {formatMoneyUS(total.fob)}

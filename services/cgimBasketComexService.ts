@@ -1,121 +1,95 @@
-// services/cgimBasketComexService.ts
-/**
- * CGIM basket service
- * - Canônico: fetchBasketAnnualByNcm(ncms, {flow, years,...}) -> séries por NCM
- * - Compat UI antiga: fetchAnnualBasketByNcm({entity, year, flow, ncms,...}) -> linhas anuais
- */
-
-import { fetchComexYearByNcm, type TradeFlow } from "./comexApiService";
 import { normalizeNcm } from "../utils/cgimAggregation";
+import {
+  fetchComexYearByNcm,
+  fetchComexYearByNcmList,
+  normalizeNcmTo8,
+  type TradeFlow,
+} from "./comexApiService";
 
-// Tipos mínimos (sem depender de cgimTypes.ts)
 export type Year = number;
 
-export interface NcmYearValue {
-  fob: number;
-  kg: number;
-}
-
-export interface NcmSeries {
-  ncmRaw: string;
-  ncm: string;
-  years: Record<string, NcmYearValue>;
-}
-
-export interface BasketProgress {
-  total: number;
+export type BasketProgress = {
   done: number;
-  current?: { ncm: string; year: number };
-  stage?: string;
-}
+  total: number;
+};
 
 export interface BasketOptions {
   flow: TradeFlow;       // "imp" | "exp"
   years: Year[];
   concurrency?: number;  // default 4
+  chunkSize?: number;    // default 80 (tamanho do lote por chamada no ComexStat)
   useCache?: boolean;    // default true
   cacheTtlHours?: number;// default 72
   onProgress?: (p: BasketProgress) => void;
 }
 
-export interface CgimAnnualBasketRow {
-  ncm: string;
-  fob: number;
-  kg: number;
-}
-
-export interface FetchAnnualBasketByNcmArgs {
-  entity?: string; // não é usado na consulta, mas pode entrar na chave futuramente
-  year: string | number;
-  flow: "import" | "export";
-  ncms: string[];
-  chunkSize?: number;   // usado só para progress simples
-  concurrency?: number;
-  useCache?: boolean;
-  cacheTtlHours?: number;
-  onProgress?: (info: { done: number; total: number }) => void;
-}
+export type NcmSeries = {
+  ncm: string;          // 8 dígitos
+  raw: string;          // como veio
+  years: Record<number, { fob: number; kg: number }>;
+};
 
 const DEFAULTS = {
   concurrency: 4,
+  chunkSize: 80,
   useCache: true,
   cacheTtlHours: 72,
 };
-
-function cacheKey(flow: TradeFlow, ncm: string, year: number) {
-  return `cgim:comex:${flow}:${ncm}:${year}`;
-}
 
 function nowMs() {
   return Date.now();
 }
 
-function getCached(flow: TradeFlow, ncm: string, year: number, ttlHours: number): NcmYearValue | null {
-  const k = cacheKey(flow, ncm, year);
-  const raw = localStorage.getItem(k);
-  if (!raw) return null;
+type CacheItem = {
+  ts: number;
+  v: { fob: number; kg: number };
+};
+
+function cacheKey(flow: TradeFlow, year: number, ncm: string) {
+  // "v2" para invalidar cache antigo que pode ter sido preenchido com zeros
+  // quando a API falhou em lote (evita "envenenar" a árvore com zeros por 72h).
+  return `cgimBasket:v2:${flow}:${year}:${ncm}`;
+}
+
+function getCached(flow: TradeFlow, year: number, ncm: string, ttlHours: number): CacheItem | null {
   try {
-    const obj = JSON.parse(raw) as { ts: number; fob: number; kg: number };
-    if (!obj?.ts) return null;
-    if (nowMs() - obj.ts > ttlHours * 3600_000) return null;
-    return { fob: Number(obj.fob) || 0, kg: Number(obj.kg) || 0 };
+    const raw = localStorage.getItem(cacheKey(flow, year, ncm));
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as CacheItem;
+    if (!parsed?.ts || !parsed?.v) return null;
+    const ageMs = nowMs() - parsed.ts;
+    if (ageMs > ttlHours * 3600 * 1000) return null;
+    return parsed;
   } catch {
     return null;
   }
 }
 
-function setCached(flow: TradeFlow, ncm: string, year: number, value: NcmYearValue) {
-  const k = cacheKey(flow, ncm, year);
+function setCached(flow: TradeFlow, year: number, ncm: string, v: { fob: number; kg: number }) {
   try {
-    localStorage.setItem(k, JSON.stringify({ ts: nowMs(), fob: value.fob ?? 0, kg: value.kg ?? 0 }));
+    const item: CacheItem = { ts: nowMs(), v };
+    localStorage.setItem(cacheKey(flow, year, ncm), JSON.stringify(item));
   } catch {
     // ignore
   }
 }
 
-async function runPool<T, R>(
-  items: T[],
-  concurrency: number,
-  worker: (item: T) => Promise<R>
-): Promise<R[]> {
-  const results: R[] = new Array(items.length);
+async function runPool<T>(tasks: Array<() => Promise<T>>, concurrency: number): Promise<T[]> {
+  const results: T[] = [];
   let idx = 0;
 
-  const runners = new Array(Math.min(concurrency, items.length)).fill(0).map(async () => {
-    while (true) {
-      const i = idx++;
-      if (i >= items.length) break;
-      results[i] = await worker(items[i]);
+  async function worker() {
+    while (idx < tasks.length) {
+      const cur = idx++;
+      results[cur] = await tasks[cur]();
     }
-  });
+  }
 
-  await Promise.all(runners);
+  const workers = Array.from({ length: Math.max(1, concurrency) }, () => worker());
+  await Promise.all(workers);
   return results;
 }
 
-/**
- * ✅ CANÔNICO: retorna séries por NCM, com years[YYYY] = {fob,kg}
- */
 export async function fetchBasketAnnualByNcm(
   ncmListRaw: string[],
   options: BasketOptions
@@ -123,99 +97,128 @@ export async function fetchBasketAnnualByNcm(
   const cfg = { ...DEFAULTS, ...options };
   const years = (cfg.years || []).map(Number).filter((y) => Number.isFinite(y));
 
-  const normalized = (ncmListRaw || []).map((raw) => ({ raw, ncm: normalizeNcm(raw) }));
-  const valid = normalized.filter((x) => x.ncm) as Array<{ raw: string; ncm: string }>;
+  // normaliza NCMs, mantendo raw
+  const valid = (ncmListRaw || [])
+    .map((raw) => ({ raw, ncm: normalizeNcm(raw) }))
+    .filter((x) => x.ncm && x.ncm.length === 8);
 
   const totalTasks = valid.length * years.length;
   let done = 0;
+  const onProgress = cfg.onProgress;
 
-  const progress = (current?: { ncm: string; year: number }, stage?: string) => {
-    cfg.onProgress?.({ total: totalTasks, done, current, stage });
-  };
-
-  progress(undefined, "init");
-
-  const tasks: Array<{ ncm: string; ncmRaw: string; year: number }> = [];
+  const byNcm: Map<string, NcmSeries> = new Map();
   for (const item of valid) {
-    for (const y of years) tasks.push({ ncm: item.ncm, ncmRaw: item.raw, year: y });
+    if (!byNcm.has(item.ncm)) {
+      byNcm.set(item.ncm, { ncm: item.ncm, raw: item.raw, years: {} });
+    }
   }
 
-  const taskResults = await runPool(tasks, cfg.concurrency!, async (t) => {
-    progress({ ncm: t.ncm, year: t.year }, "fetch");
+  // ✅ NOVO: por ano, busca em lotes (bem menos chamadas => bem menos timeout)
+  for (const y of years) {
+    const toFetch: string[] = [];
 
-    if (cfg.useCache) {
-      const cached = getCached(cfg.flow, t.ncm, t.year, cfg.cacheTtlHours!);
-      if (cached) {
-        done++;
-        progress({ ncm: t.ncm, year: t.year }, "cache_hit");
-        return { ...t, value: cached };
+    // 1) cache primeiro
+    for (const item of valid) {
+      const serie = byNcm.get(item.ncm)!;
+
+      if (cfg.useCache) {
+        const cached = getCached(cfg.flow, y, item.ncm, cfg.cacheTtlHours);
+        if (cached) {
+          serie.years[y] = cached.v;
+          done++;
+          onProgress?.({ done, total: totalTasks });
+          continue;
+        }
       }
+
+      // precisa buscar
+      toFetch.push(item.ncm);
     }
 
-    const value = await fetchComexYearByNcm({ flow: cfg.flow, ncm: t.ncm, year: t.year });
+    if (!toFetch.length) continue;
 
-    if (cfg.useCache) setCached(cfg.flow, t.ncm, t.year, value);
-
-    done++;
-    progress({ ncm: t.ncm, year: t.year }, "fetched");
-
-    return { ...t, value };
-  });
-
-  const byNcm = new Map<string, NcmSeries>();
-
-  for (const r of taskResults) {
-    if (!byNcm.has(r.ncm)) {
-      byNcm.set(r.ncm, { ncmRaw: r.ncmRaw, ncm: r.ncm, years: {} });
+    const BATCH_SIZE = Math.max(1, Number(cfg.chunkSize) || 80);
+    const batches: string[][] = [];
+    for (let i = 0; i < toFetch.length; i += BATCH_SIZE) {
+      batches.push(toFetch.slice(i, i + BATCH_SIZE));
     }
-    byNcm.get(r.ncm)!.years[String(r.year)] = { fob: r.value.fob ?? 0, kg: r.value.kg ?? 0 };
+
+    const tasks = batches.map((batch) => async () => {
+      const rows = await fetchComexYearByNcmList({
+        flow: cfg.flow,
+        year: y,
+        ncms: batch.map((n) => normalizeNcmTo8(n)),
+      });
+
+      // Se o lote voltou vazio, isso quase sempre é falha (timeout/URL grande/rate limit).
+      // Nessa situação, NÃO salvamos cache de zeros (para não travar a entidade por horas).
+      const apiLikelyFailed = (rows?.length ?? 0) === 0 && batch.length > 0;
+
+      const map = new Map<string, { fob: number; kg: number }>();
+      for (const r of rows) {
+        map.set(normalizeNcmTo8(r.ncm), { fob: r.fob, kg: r.kg });
+      }
+
+      // completa faltantes com 0 e salva cache/serie
+      for (const ncm of batch) {
+        const n8 = normalizeNcmTo8(ncm);
+        const v = map.get(n8) ?? { fob: 0, kg: 0 };
+        const serie = byNcm.get(n8)!;
+        serie.years[y] = v;
+
+        if (cfg.useCache && !apiLikelyFailed) setCached(cfg.flow, y, n8, v);
+
+        done++;
+        onProgress?.({ done, total: totalTasks });
+      }
+
+      return true;
+    });
+
+    await runPool(tasks, cfg.concurrency);
   }
 
-  progress(undefined, "done");
   return Array.from(byNcm.values());
 }
 
-/**
- * ✅ COMPAT (UI antiga): retorna linhas anuais {ncm,fob,kg} para UM ano
- * Este é o export que seu CgimAnalyticsPage.tsx está tentando importar.
- */
-export async function fetchAnnualBasketByNcm(args: FetchAnnualBasketByNcmArgs): Promise<CgimAnnualBasketRow[]> {
+export type CgimAnnualBasketRow = {
+  ncm: string;
+  fob: number;
+  kg: number;
+};
+
+type FlowType = "import" | "export";
+
+export async function fetchAnnualBasketByNcm(args: {
+  entity: string;
+  year: string;
+  flow: FlowType;
+  ncms: string[];
+  chunkSize?: number;
+  concurrency?: number;
+  onProgress?: (p: { done: number; total: number }) => void;
+  useCache?: boolean;
+  cacheTtlHours?: number;
+}): Promise<CgimAnnualBasketRow[]> {
   const yearNum = Number(args.year);
-  if (!Number.isFinite(yearNum)) throw new Error(`Ano inválido: ${args.year}`);
-
   const flow: TradeFlow = args.flow === "export" ? "exp" : "imp";
-  const ncms = (args.ncms || []).map((n) => normalizeNcm(n)).filter(Boolean) as string[];
+  const ncms = (args.ncms || []).map((n) => normalizeNcm(n)).filter(Boolean);
 
-  const total = ncms.length;
-  let done = 0;
-
-  const tick = () => args.onProgress?.({ done, total });
-
-  // Usa o canônico por baixo (1 ano só)
   const seriesList = await fetchBasketAnnualByNcm(ncms, {
     flow,
     years: [yearNum],
     concurrency: args.concurrency ?? 2,
+    chunkSize: args.chunkSize ?? 80,
     useCache: args.useCache ?? true,
     cacheTtlHours: args.cacheTtlHours ?? 72,
     onProgress: (p) => {
-      // p.done é tasks (ncm*anos). Aqui anos=1, então aproxima:
-      done = Math.min(total, p.done);
-      tick();
+      args.onProgress?.(p);
     },
   });
 
-  const out: CgimAnnualBasketRow[] = seriesList.map((s) => {
-    const v = s.years[String(yearNum)] ?? { fob: 0, kg: 0 };
-    return {
-      ncm: s.ncm,
-      fob: Number(v.fob) || 0,
-      kg: Number(v.kg) || 0,
-    };
-  });
-
-  done = total;
-  tick();
-
-  return out;
+  return seriesList.map((s) => ({
+    ncm: s.ncm,
+    fob: s.years[yearNum]?.fob ?? 0,
+    kg: s.years[yearNum]?.kg ?? 0,
+  }));
 }
