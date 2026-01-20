@@ -107,6 +107,8 @@ export default function CgimAnalyticsPage() {
     unmappedNcms: number;
     apiLikelyDown: boolean;
     maxDepth: number;
+    duplicateNcms: number;
+    conflictingMappings: number;
   } | null>(null);
 
   const loadDictionary = React.useMemo(() => {
@@ -115,6 +117,9 @@ export default function CgimAnalyticsPage() {
       ["loadCgimDictionaryForEntity", "loadDictionaryForEntity", "getCgimDictionaryForEntity", "getDictionaryForEntity"]
     );
   }, []);
+
+  // ✅ Cache em memória do dicionário por entidade (acelera troca de ano/fluxo)
+  const dictCacheRef = React.useRef<Map<string, cgimDictionaryService.CgimDictEntry[]>>(new Map());
 
   // ✅ Carrega entidades do Excel (pack)
   React.useEffect(() => {
@@ -156,7 +161,9 @@ export default function CgimAnalyticsPage() {
       setProgress(null);
 
       try {
-        const dictEntries = await loadDictionary(entity);
+        const cached = dictCacheRef.current.get(entity);
+        const dictEntries = cached ?? (await loadDictionary(entity));
+        if (!cached) dictCacheRef.current.set(entity, dictEntries);
 
         const maxDepthFound =
           dictEntries.reduce((acc, e) => {
@@ -169,7 +176,7 @@ export default function CgimAnalyticsPage() {
         const effectiveDepth = Math.min(subcatDepth, maxDepthFound || 1);
         if (effectiveDepth !== subcatDepth) setSubcatDepth(effectiveDepth);
 
-        const dictRows: DictionaryRow[] = (dictEntries ?? []).map((e) => {
+        const dictRowsRaw: DictionaryRow[] = (dictEntries ?? []).map((e) => {
           const categoria = String(e.categoria ?? "").trim();
           const subLabel = buildSubcategoryLabel(e.subcategorias ?? [], effectiveDepth);
 
@@ -180,15 +187,57 @@ export default function CgimAnalyticsPage() {
           };
         });
 
-        const ncms = Array.from(new Set(dictRows.map((r) => normalizeNcm(r.ncm)).filter(Boolean)));
+        // ✅ Linhas completas (SEM dedup) apenas para semear a taxonomia (categorias/subcategorias)
+        // Isso evita “sumir” categoria quando a UI deduplica NCMs duplicadas por estabilidade.
+        const seedRows: DictionaryRow[] = (dictRowsRaw ?? [])
+          .map((r) => ({
+            ncm: normalizeNcm(r.ncm),
+            categoria: String(r.categoria ?? "").trim() || "Sem categoria (mapeamento incompleto)",
+            subcategoria: r.subcategoria ? String(r.subcategoria).trim() : null,
+          }))
+          .filter((r) => !!r.ncm) as DictionaryRow[];
+
+        // ✅ (CGIM) Dedup por NCM: evita sobrescrita silenciosa ("last wins")
+        // Se o mesmo NCM aparece em mais de uma categoria/subcategoria no Excel,
+        // a estrutura pode "sumir" (ex: Semi-acabados) por causa de overwrite.
+        const seen = new Map<string, { categoria: string; subcategoria: string | null }>();
+        let duplicateNcms = 0;
+        let conflictingMappings = 0;
+
+        const dictRows: DictionaryRow[] = [];
+        for (const r of dictRowsRaw) {
+          const ncmNorm = normalizeNcm(r.ncm);
+          if (!ncmNorm) continue;
+          const nextMap = { categoria: r.categoria, subcategoria: r.subcategoria };
+
+          if (!seen.has(ncmNorm)) {
+            seen.set(ncmNorm, nextMap);
+            dictRows.push({ ...r, ncm: ncmNorm });
+            continue;
+          }
+
+          duplicateNcms++;
+          const prev = seen.get(ncmNorm)!;
+          const isConflict =
+            prev.categoria !== nextMap.categoria || (prev.subcategoria ?? null) !== (nextMap.subcategoria ?? null);
+          if (isConflict) {
+            conflictingMappings++;
+            // mantém o primeiro mapeamento (mais estável/"primeiro wins")
+            // (se quiser inverter para "último wins", troque aqui)
+          }
+        }
+
+        const ncms = Array.from(new Set(dictRows.map((r) => r.ncm).filter(Boolean)));
 
         const basketRows: CgimAnnualBasketRow[] = await fetchAnnualBasketByNcm({
           entity,
           year: String(year),
           flow,
           ncms,
-          chunkSize: 60,
-          concurrency: 2,
+          // ✅ performance: mais concorrência (mantendo batch) melhora tempo
+          // se aparecer 429, reduza concurrency para 2.
+          chunkSize: 80,
+          concurrency: 4,
           onProgress: (info) => {
             if (!cancelled) setProgress(info);
           },
@@ -227,13 +276,18 @@ export default function CgimAnalyticsPage() {
           unmappedNcms,
           apiLikelyDown,
           maxDepth: maxDepthFound,
+          duplicateNcms,
+          conflictingMappings,
         });
 
         const nextTree = buildHierarchyTree({
           dictRows,
+          seedRows,
           comexRows,
           includeUnmapped: true,
           includeAllZero: apiLikelyDown,
+          seedGroupsFromDictionary: true,
+          includeZeroLeaves: false,
         });
 
         setTree(nextTree);
@@ -264,6 +318,11 @@ export default function CgimAnalyticsPage() {
   );
 
   const total = React.useMemo(() => computeTotal(tree), [tree]);
+
+  const progressPct = React.useMemo(() => {
+    if (!progress || !progress.total) return null;
+    return Math.max(0, Math.min(100, Math.round((progress.done / progress.total) * 100)));
+  }, [progress]);
 
   const expandAll = React.useCallback(() => {
     const ids = new Set<string>();
@@ -323,6 +382,39 @@ export default function CgimAnalyticsPage() {
 
   return (
     <div style={{ padding: 18, display: "flex", flexDirection: "column", gap: 14 }}>
+      {loading && (
+        <div
+          style={{
+            position: "sticky",
+            top: 0,
+            zIndex: 50,
+            padding: "10px 12px",
+            borderRadius: 12,
+            border: "1px solid #eee",
+            background: "#fff",
+            boxShadow: "0 4px 14px rgba(0,0,0,0.06)",
+          }}
+        >
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12 }}>
+            <div style={{ fontSize: 13, fontWeight: 700 }}>Carregando…</div>
+            <div style={{ fontSize: 12, opacity: 0.75, fontVariantNumeric: "tabular-nums" }}>
+              {progress ? `${progress.done}/${progress.total}` : "—"}
+              {progressPct !== null ? ` • ${progressPct}%` : ""}
+            </div>
+          </div>
+          <div style={{ height: 8, marginTop: 8, borderRadius: 999, background: "#e9e9e9", overflow: "hidden" }}>
+            <div
+              style={{
+                height: "100%",
+                width: `${progressPct ?? 15}%`,
+                background: "#111",
+                transition: "width 200ms ease",
+              }}
+            />
+          </div>
+        </div>
+      )}
+
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-end", gap: 12 }}>
         <div>
           <h2 style={{ margin: 0 }}>Comexsetor • Módulo CGIM</h2>
@@ -353,6 +445,7 @@ export default function CgimAnalyticsPage() {
 
                 setEntity(e.target.value);
               }}
+              disabled={loading}
               style={selectBoxStyle}
             >
               {entities.map((en) => (
@@ -368,6 +461,7 @@ export default function CgimAnalyticsPage() {
             <select
               value={year}
               onChange={(e) => setYear(Number(e.target.value))}
+              disabled={loading}
               style={selectBoxStyle}
             >
               {years.map((y) => (
@@ -383,6 +477,7 @@ export default function CgimAnalyticsPage() {
             <select
               value={flow}
               onChange={(e) => setFlow(e.target.value as FlowType)}
+              disabled={loading}
               style={selectBoxStyle}
             >
               <option value="import">Importação</option>
@@ -395,6 +490,7 @@ export default function CgimAnalyticsPage() {
             <select
               value={detailLevel}
               onChange={(e) => setDetailLevel(e.target.value as DetailLevel)}
+              disabled={loading}
               style={selectBoxStyle}
             >
               <option value="CATEGORY">Somente Categoria</option>
@@ -411,6 +507,7 @@ export default function CgimAnalyticsPage() {
                     setSelectedSubcategories([]);
                     setSubcatDepth(Number(e.target.value));
                   }}
+                  disabled={loading}
                   style={selectBoxStyle}
                 >
                   {Array.from({ length: Math.max(1, maxSubcatDepth) }, (_, i) => i + 1).map((d) => (
@@ -442,6 +539,7 @@ export default function CgimAnalyticsPage() {
                 setSelectedCategories(values);
                 setSelectedSubcategories([]);
               }}
+              disabled={loading}
               style={multiSelectStyleBase}
             >
               {availableCategories.map((c) => (
@@ -464,6 +562,7 @@ export default function CgimAnalyticsPage() {
                 const values = Array.from(e.target.selectedOptions).map((o) => o.value);
                 setSelectedSubcategories(values);
               }}
+              disabled={loading}
               style={multiSelectSubcatStyle}
             >
               {availableSubcategories.map((s) => (
@@ -485,7 +584,7 @@ export default function CgimAnalyticsPage() {
               <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
                 <button
                   onClick={() => expandAll()}
-                  disabled={!tree.length}
+                  disabled={loading || !tree.length}
                   style={{
                     padding: "10px 12px",
                     borderRadius: 10,
@@ -498,7 +597,7 @@ export default function CgimAnalyticsPage() {
                 </button>
                 <button
                   onClick={() => collapseAll()}
-                  disabled={!tree.length}
+                  disabled={loading || !tree.length}
                   style={{
                     padding: "10px 12px",
                     borderRadius: 10,
@@ -511,6 +610,7 @@ export default function CgimAnalyticsPage() {
                 </button>
                 <button
                   onClick={() => resetFilters()}
+                  disabled={loading}
                   style={{
                     padding: "10px 12px",
                     borderRadius: 10,
@@ -537,6 +637,12 @@ export default function CgimAnalyticsPage() {
                   <div>
                     Dicionário: {diagnostics.dictRows} linhas • {diagnostics.distinctNcms} NCMs únicos
                   </div>
+                  <div>
+                    Duplicidades de NCM (no Excel): {diagnostics.duplicateNcms}
+                    {diagnostics.conflictingMappings ? (
+                      <> • Conflitos de mapeamento: {diagnostics.conflictingMappings}</>
+                    ) : null}
+                  </div>
                   <div>Sem categoria (no dicionário): {diagnostics.missingCategoria}</div>
                   <div>Sem subcategoria (no dicionário): {diagnostics.missingSubcategoria}</div>
                   <div>Máx. profundidade subcat: {diagnostics.maxDepth}</div>
@@ -555,17 +661,7 @@ export default function CgimAnalyticsPage() {
           </div>
         </div>
 
-        {loading && (
-          <div style={{ marginTop: 12, fontSize: 13, opacity: 0.75 }}>
-            Carregando dados… {progress ? `(${progress.done}/${progress.total} chunks)` : ""}
-          </div>
-        )}
-
-        {error && (
-          <div style={{ marginTop: 12, color: "#b00020", fontSize: 13 }}>
-            {error}
-          </div>
-        )}
+        {error && <div style={{ marginTop: 12, color: "#b00020", fontSize: 13 }}>{error}</div>}
       </div>
 
       <div style={cardStyle}>
