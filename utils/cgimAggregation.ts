@@ -1,13 +1,9 @@
 // utils/cgimAggregation.ts
 /**
- * CGIM Aggregation (consolidado em 1 arquivo)
- * - Compatível com CgimAnalyticsPage.tsx "bonito"
- * - Não depende de cgimAggregationCanonical.ts
- *
- * Responsabilidades:
- * 1) Normalizar NCM (8 dígitos)
- * 2) Construir árvore Categoria -> Subcategoria -> NCM
- * 3) Helpers para UI: total, listas de categorias/subcategorias
+ * CGIM Aggregation
+ * - Monta árvore Categoria -> Subcategoria -> NCM
+ * - Permite "seed" de categorias/subcategorias a partir do dicionário
+ *   (para não sumirem quando o ano selecionado zera tudo)
  */
 
 export type DetailLevel = "CATEGORY" | "SUBCATEGORY" | "NCM";
@@ -45,16 +41,11 @@ function slug(label: string): string {
     .replace(/[^\w-]+/g, "");
 }
 
-/**
- * Normaliza NCM para 8 dígitos.
- * Retorna null se não der pra formar uma NCM válida.
- */
 export function normalizeNcm(raw: unknown): string | null {
   if (raw === null || raw === undefined) return null;
   const digits = String(raw).replace(/\D/g, "");
   if (!digits) return null;
 
-  // Excel às vezes tira zeros à esquerda
   const padded = digits.padStart(8, "0");
   if (padded.length !== 8) return null;
 
@@ -89,55 +80,22 @@ export function listSubcategories(tree: HierarchyNode[], selectedCategories: str
   return Array.from(subs).sort((a, b) => a.localeCompare(b, "pt-BR"));
 }
 
-/**
- * Constrói a árvore usando explicitamente o dicionário.
- *
- * includeUnmapped:
- *  - true: NCMs que vierem do Comex mas não estiverem no dicionário vão para "Sem categoria (não mapeado)"
- *  - false: descarta NCMs sem mapeamento
- *
- * includeAllZero:
- *  - false (padrão): remove NCMs com (FOB=0 e KG=0)
- *  - true: mantém (útil só pra auditoria)
- */
 export function buildHierarchyTree(args: {
-  dictRows: DictionaryRow[];
-  /**
-   * Opcional: linhas usadas APENAS para semear (criar) a estrutura de
-   * categorias/subcategorias (taxonomia).
-   *
-   * Motivação (CGIM): quando existem NCMs duplicadas no Excel (mesma NCM em
-   * mais de uma categoria/subcategoria), a UI pode deduplicar as linhas para
-   * evitar conflitos de mapeamento. Se usarmos apenas as linhas deduplicadas
-   * para “seedar” a árvore, algumas categorias/subcategorias podem sumir.
-   *
-   * Este campo permite manter a taxonomia completa (seedRows), enquanto o
-   * mapeamento NCM->categoria/subcategoria continua consistente (dictRows).
-   */
-  seedRows?: DictionaryRow[];
+  dictRows: DictionaryRow[]; // usado p/ mapeamento NCM -> categoria/subcategoria
+  seedRows?: DictionaryRow[]; // usado só p/ criar a taxonomia (não deixa sumir)
   comexRows: Array<{ ncm: string; metricFOB: number; metricKG: number }>;
   includeUnmapped?: boolean;
-  includeAllZero?: boolean;
-  /**
-   * ✅ CGIM: quando true, cria categorias/subcategorias a partir do dicionário
-   * mesmo que não exista nenhum NCM com valor no Comex para o recorte.
-   * Isso evita “sumir” categorias (ex: Semi-acabados) quando tudo estiver 0.
-   */
-  seedGroupsFromDictionary?: boolean;
-  /**
-   * ✅ CGIM: quando false (padrão), NCMs com (FOB=0 e KG=0) não aparecem como folhas,
-   * mas o grupo (categoria/subcategoria) pode permanecer (seedGroupsFromDictionary).
-   */
-  includeZeroLeaves?: boolean;
+  includeAllZero?: boolean; // inclui folhas 0/0
+  seedGroupsFromDictionary?: boolean; // mantém categoria/subcat mesmo sem folhas
+  includeZeroLeaves?: boolean; // mostra folhas zeradas
 }): HierarchyNode[] {
   const includeUnmapped = args.includeUnmapped ?? true;
   const includeAllZero = args.includeAllZero ?? false;
   const seedGroupsFromDictionary = args.seedGroupsFromDictionary ?? false;
   const includeZeroLeaves = args.includeZeroLeaves ?? false;
 
-  // index do dicionário: ncm -> {categoria, subcategoria}
+  // index: NCM -> mapping
   const dictIndex = new Map<string, { categoria: string; subcategoria: string | null }>();
-
   for (const r of args.dictRows ?? []) {
     const ncm = normalizeNcm(r.ncm);
     if (!ncm) continue;
@@ -148,10 +106,9 @@ export function buildHierarchyTree(args: {
     dictIndex.set(ncm, { categoria, subcategoria });
   }
 
-  // acumula nós por categoria
   const catMap = new Map<string, HierarchyNode>();
 
-  // ✅ (opcional) semeia categorias/subcategorias a partir do dicionário
+  // ✅ seed: cria categorias/subcategorias mesmo sem valores
   if (seedGroupsFromDictionary) {
     const rowsForSeed = (args.seedRows ?? args.dictRows) ?? [];
     for (const r of rowsForSeed) {
@@ -170,6 +127,7 @@ export function buildHierarchyTree(args: {
         });
       }
       const catNode = catMap.get(categoria)!;
+
       let subNode = (catNode.children ?? []).find((c) => c.level === "subcategory" && c.name === subLabel);
       if (!subNode) {
         subNode = {
@@ -185,32 +143,27 @@ export function buildHierarchyTree(args: {
     }
   }
 
+  // popula comex
   for (const row of args.comexRows ?? []) {
     const ncm = normalizeNcm(row.ncm);
     if (!ncm) continue;
 
     const fob = Number(row.metricFOB) || 0;
     const kg = Number(row.metricKG) || 0;
-
     const isZero = fob === 0 && kg === 0;
 
-    // includeAllZero: mant. (útil p/ auditoria)
-    // includeZeroLeaves: mostra folhas zeradas
-    // seedGroupsFromDictionary: mantém grupos mesmo sem folhas
     if (isZero && !includeAllZero && !includeZeroLeaves) {
-      // não adiciona a folha, mas mantém o grupo se tiver sido semeado
+      // não cria folha, mas mantém grupo se tiver seed
       continue;
     }
 
     const mapping = dictIndex.get(ncm);
-
     if (!mapping && !includeUnmapped) continue;
 
     const categoria = mapping?.categoria ?? "Sem categoria (não mapeado)";
     const rawSub = mapping?.subcategoria ?? null;
     const subLabel = rawSub && rawSub.trim() ? rawSub.trim() : "Sem subcategoria";
 
-    // Categoria node
     if (!catMap.has(categoria)) {
       catMap.set(categoria, {
         id: `cat:${slug(categoria)}`,
@@ -223,7 +176,6 @@ export function buildHierarchyTree(args: {
     }
     const catNode = catMap.get(categoria)!;
 
-    // Subcategoria node
     let subNode = (catNode.children ?? []).find((c) => c.level === "subcategory" && c.name === subLabel);
     if (!subNode) {
       subNode = {
@@ -237,7 +189,6 @@ export function buildHierarchyTree(args: {
       catNode.children!.push(subNode);
     }
 
-    // NCM leaf
     const ncmNode: HierarchyNode = {
       id: `ncm:${ncm}`,
       level: "ncm",
@@ -248,21 +199,19 @@ export function buildHierarchyTree(args: {
 
     subNode.children!.push(ncmNode);
 
-    // Soma métricas
     subNode.metrics.fob += fob;
     subNode.metrics.kg += kg;
     catNode.metrics.fob += fob;
     catNode.metrics.kg += kg;
   }
 
-  // ✅ remove subcategorias vazias se não semeamos (comportamento antigo)
+  // se não seed, remove vazios
   if (!seedGroupsFromDictionary) {
     for (const cat of catMap.values()) {
       cat.children = (cat.children ?? []).filter((s) => (s.children ?? []).length > 0);
     }
   }
 
-  // ✅ remove categorias vazias se não semeamos
   const tree = Array.from(catMap.values())
     .filter((c) => seedGroupsFromDictionary || (c.children ?? []).length > 0)
     .sort((a, b) => b.metrics.fob - a.metrics.fob);

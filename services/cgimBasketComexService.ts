@@ -75,7 +75,8 @@ const DEFAULTS = {
 };
 
 function cacheKey(flow: TradeFlow, ncm: string, year: number) {
-  return `cgim:comex:${flow}:${ncm}:${year}`;
+  // ✅ v2 para não reutilizar caches antigos que podem ter gravado zeros por falha de rede/rate-limit
+  return `cgim:comex:v2:${flow}:${ncm}:${year}`;
 }
 
 function nowMs() {
@@ -233,6 +234,45 @@ export async function fetchAnnualBasketByNcm(args: FetchAnnualBasketByNcmArgs): 
   // 2) consulta pendentes em lotes
   const chunks = chunkArray(pending, batchSize);
 
+  // Helper: tenta resolver NCMs faltantes com lotes menores e, se necessário, 1-a-1.
+  // Motivo: o endpoint em lote do ComexStat às vezes retorna apenas parte das NCMs do payload
+  // (limite de tamanho/URL, limite interno, ou falhas intermitentes).
+  async function resolveMissing(missing: string[]): Promise<void> {
+    if (!missing.length) return;
+
+    // 2.1) tenta novamente em lotes menores (reduz chance de truncamento/limite)
+    const retryBatchSize = 15;
+    const retryChunks = chunkArray(missing, retryBatchSize);
+
+    for (const sub of retryChunks) {
+      let subRows: NcmYearRow[] = [];
+      try {
+        subRows = await fetchComexYearByNcmList({ flow, year: yearNum, ncms: sub });
+      } catch {
+        subRows = [];
+      }
+
+      const got2 = new Map<string, { fob: number; kg: number }>();
+      for (const r of subRows || []) {
+        const n = r?.ncm;
+        if (!n) continue;
+        const v = { fob: Number(r.fob) || 0, kg: Number(r.kg) || 0 };
+        got2.set(n, v);
+        valuesByNcm.set(n, v);
+        if (useCache) setCached(flow, n, yearNum, v);
+      }
+
+      // 2.2) ainda faltou? tenta 1-a-1 (mais lento, mas evita zerar indevidamente)
+      for (const n of sub) {
+        if (got2.has(n)) continue;
+        const v = await fetchComexYearByNcm({ flow, ncm: n, year: yearNum });
+        const vv = { fob: Number(v.fob) || 0, kg: Number(v.kg) || 0 };
+        valuesByNcm.set(n, vv);
+        if (useCache) setCached(flow, n, yearNum, vv);
+      }
+    }
+  }
+
   await runPool(chunks, concurrency, async (chunk) => {
     let rows: NcmYearRow[] = [];
     try {
@@ -253,7 +293,9 @@ export async function fetchAnnualBasketByNcm(args: FetchAnnualBasketByNcmArgs): 
       if (useCache) setCached(flow, n, yearNum, v);
     }
 
-    // completa faltantes do lote com 0 (e opcionalmente faz fallback 1-a-1 se o lote vier vazio)
+    // completa faltantes do lote:
+    // - se o lote vier vazio: fallback 1-a-1 (já existia)
+    // - se o lote vier parcial: tenta resolver faltantes (lotes menores -> 1-a-1)
     if (rows.length === 0) {
       // fallback: tenta 1-a-1 para não ficar tudo zerado quando o endpoint em lote falhar
       for (const n of chunk) {
@@ -267,11 +309,15 @@ export async function fetchAnnualBasketByNcm(args: FetchAnnualBasketByNcmArgs): 
       return [];
     }
 
+    const missing = chunk.filter((n) => !got.has(n));
+    if (missing.length) {
+      await resolveMissing(missing);
+    }
+
     for (const n of chunk) {
-      if (!got.has(n)) {
-        valuesByNcm.set(n, { fob: 0, kg: 0 });
-        if (useCache) setCached(flow, n, yearNum, { fob: 0, kg: 0 });
-      }
+      // Se ainda faltar após as tentativas, assume 0 — mas NÃO faz cache desse 0
+      // (senão você “congela” um erro de rede como se fosse dado real).
+      if (!valuesByNcm.has(n)) valuesByNcm.set(n, { fob: 0, kg: 0 });
       done++;
     }
     tick();
