@@ -145,14 +145,25 @@ async function fetchWithTimeout(url: string, timeoutMs: number): Promise<Respons
  * Se este parser falhar, o CGIM zera tudo (porque acha que "não veio nada").
  */
 function extractRows(json: any): any[] {
-  // ✅ (NOVO) Formato mais comum na API nova: { data: { list: [...] } }
+  // ✅ Formato comum na API nova: { data: { list: [...] } }
   const list =
     json?.data?.list ??
     json?.Data?.list ??
     json?.result?.list ??
     json?.resultado?.list;
 
-  if (Array.isArray(list)) return list;
+  // ✅ (AJUSTE) Às vezes o "list" vem como array legado dentro (list[0][0])
+  if (Array.isArray(list)) {
+    // list pode ser: [ [rows], meta ]  OU  rows direto
+    const maybe = list?.[0]?.[0];
+    if (Array.isArray(maybe)) return maybe;
+
+    const maybe2 = list?.[0];
+    if (Array.isArray(maybe2) && (maybe2.length === 0 || typeof maybe2[0] === "object")) return maybe2;
+
+    if (list.length === 0) return list;
+    if (list.length > 0 && typeof list[0] === "object" && !Array.isArray(list[0])) return list;
+  }
 
   // --- Helper para navegar em formatos possíveis ---
   const tryArrayShape = (root: any): any[] => {
@@ -182,10 +193,20 @@ function extractRows(json: any): any[] {
   const fromData = tryArrayShape(data);
   if (fromData.length) return fromData;
 
+  // ✅ (AJUSTE) alguns endpoints aninham data.data
+  const data2 = data?.data ?? data?.Data ?? data?.result ?? data?.resultado;
+  const fromData2 = tryArrayShape(data2);
+  if (fromData2.length) return fromData2;
+
   // 3) alguns endpoints podem aninhar mais um nível
   const deep = json?.data?.data ?? json?.data?.rows ?? json?.rows;
   const fromDeep = tryArrayShape(deep);
   if (fromDeep.length) return fromDeep;
+
+  // ✅ (AJUSTE) variações: data.list dentro de data.data
+  const deepList = json?.data?.data?.list ?? json?.data?.result?.list ?? json?.data?.resultado?.list;
+  const fromDeepList = tryArrayShape(deepList);
+  if (fromDeepList.length) return fromDeepList;
 
   return [];
 }
@@ -200,7 +221,7 @@ function parseGeneralResponseToValue(json: any): NcmYearValue {
   if (!rows.length) return { fob: 0, kg: 0 };
   const row = rows[0];
 
-  // ✅ (NOVO) API nova muitas vezes usa metricFOB/metricKG
+  // ✅ API nova muitas vezes usa metricFOB/metricKG
   const fob = coerceNumber(
     row?.metricFOB ??
       row?.vlFob ??
@@ -592,7 +613,7 @@ export async function fetchComexYearByNcmList(args: {
 
   const out: NcmYearRow[] = [];
   for (const r of rows ?? []) {
-    // ✅ (NOVO) Na API nova, o NCM pode vir em details.*
+    // ✅ Na API nova, o NCM pode vir em details.* ou em campos diretos
     const rawNcm =
       r?.noNcmpt ??
       r?.noNcm ??
