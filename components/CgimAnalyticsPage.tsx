@@ -373,19 +373,20 @@ export default function CgimAnalyticsPage() {
     let cancelled = false;
     let t: any = null;
 
+    // ✅ UI/UX: liga o loading IMEDIATAMENTE ao mudar filtros (evita “tela congelada” no debounce)
+    setChartsLoading(true);
+    setChartsError(null);
+
     async function runCharts() {
-      if (!dictRowsAll.length) {
-        setAnnualSeries([]);
-        setAnnualPriceSeries([]);
-        setCategoryBars([]);
-        setSubcatBars([]);
-        return;
-      }
-
-      setChartsLoading(true);
-      setChartsError(null);
-
       try {
+        if (!dictRowsAll.length) {
+          setAnnualSeries([]);
+          setAnnualPriceSeries([]);
+          setCategoryBars([]);
+          setSubcatBars([]);
+          return;
+        }
+
         const ncms = collectNcmsFromDictionary({
           dictRowsAll,
           selectedCategories,
@@ -465,6 +466,7 @@ export default function CgimAnalyticsPage() {
       }
     }
 
+    // Mantém o debounce (mínimo), mas sem “tela congelada” pois loading liga antes
     t = setTimeout(runCharts, 250);
     return () => {
       cancelled = true;
@@ -489,12 +491,15 @@ export default function CgimAnalyticsPage() {
     setSelectedSubcategories([]);
   }, []);
 
+  // ✅ Card padrão (mais próximo do NCM): borda + sombra suave (sem alterar lógica)
   const cardStyle: React.CSSProperties = {
     border: "1px solid #e6e6e6",
     borderRadius: 12,
     padding: 14,
     background: "#fff",
+    boxShadow: "0 4px 14px rgba(0,0,0,0.06)",
   };
+
   const labelStyle: React.CSSProperties = {
     fontSize: 12,
     opacity: 0.7,
@@ -529,18 +534,53 @@ export default function CgimAnalyticsPage() {
     minHeight: 260,
   };
 
-  // ✅ AQUI: barra sticky volta a cobrir TABELA e GRÁFICOS
+  // ✅ TAREFA 1: Grid 2×2 idêntico ao NCM para os 4 gráficos anuais
+  const chartGridStyle: React.CSSProperties = {
+    display: "grid",
+    gridTemplateColumns: "repeat(2, minmax(0, 1fr))",
+    gap: 12,
+    alignItems: "stretch",
+  };
+
+  // ✅ Rodapé padrão (Fonte…)
+  const sourceFooterStyle: React.CSSProperties = {
+    marginTop: 10,
+    fontSize: 12,
+    opacity: 0.7,
+    textAlign: "center",
+  };
+
+  // ✅ TAREFA 2: barra sticky volta a cobrir TABELA e GRÁFICOS
   const showTopLoading = loading || chartsLoading;
   const topLoadingTitle = loading ? "Carregando tabela…" : "Carregando gráficos…";
   const hasProgress = !!(progress && progress.total);
   const pct = hasProgress
-    ? Math.max(0, Math.min(100, Math.round((progress!.done / progress!.total) * 100)))
+    ? Math.max(
+        0,
+        Math.min(100, Math.round((progress!.done / progress!.total) * 100))
+      )
     : 0;
 
   return (
     <div
       style={{ padding: 18, display: "flex", flexDirection: "column", gap: 14 }}
     >
+      {/* ✅ CSS local p/ responsividade do grid dos gráficos (2 col desktop, 1 col mobile) */}
+      <style>
+        {`
+          @media (max-width: 900px) {
+            .cgim-annual-grid {
+              grid-template-columns: 1fr !important;
+            }
+          }
+          @keyframes cgim-indeterminate {
+            0% { transform: translateX(-120%); opacity: 0.6; }
+            50% { opacity: 1; }
+            100% { transform: translateX(320%); opacity: 0.6; }
+          }
+        `}
+      </style>
+
       {showTopLoading && (
         <div
           style={{
@@ -548,7 +588,6 @@ export default function CgimAnalyticsPage() {
             position: "sticky",
             top: 10,
             zIndex: 50,
-            boxShadow: "0 4px 14px rgba(0,0,0,0.06)",
           }}
         >
           <div
@@ -598,16 +637,6 @@ export default function CgimAnalyticsPage() {
               />
             )}
           </div>
-
-          <style>
-            {`
-              @keyframes cgim-indeterminate {
-                0% { transform: translateX(-120%); opacity: 0.6; }
-                50% { opacity: 1; }
-                100% { transform: translateX(320%); opacity: 0.6; }
-              }
-            `}
-          </style>
         </div>
       )}
 
@@ -898,9 +927,7 @@ export default function CgimAnalyticsPage() {
               marginBottom: 10,
             }}
           >
-            <div style={{ fontWeight: 900 }}>
-              Gráficos da cesta (recorte atual)
-            </div>
+            <div style={{ fontWeight: 900 }}>Gráficos da cesta (recorte atual)</div>
             <div style={{ fontSize: 12, opacity: 0.7 }}>
               {chartsLoading ? "Carregando…" : "OK"}
             </div>
@@ -920,44 +947,62 @@ export default function CgimAnalyticsPage() {
 
           {!!annualSeries.length && (
             <>
-              <SimpleLineChart
-                title="Série anual – FOB e KG (cesta agregada)"
-                data={annualSeries}
-                xAxisKey="name"
-                yAxisLabel="FOB / KG"
-                lines={[
-                  { dataKey: "fob", name: "FOB (US$)", color: "#111" },
-                  { dataKey: "kg", name: "KG", color: "#666" },
-                ]}
-              />
+              {/* ✅ TAREFA 1: 4 cards em grid 2×2 (desktop) e 1×4 (mobile) */}
+              <div className="cgim-annual-grid" style={chartGridStyle}>
+                <div style={{ minWidth: 0 }}>
+                  <SimpleLineChart
+                    title="Série anual – FOB e KG (cesta agregada)"
+                    data={annualSeries}
+                    xAxisKey="name"
+                    yAxisLabel="FOB / KG"
+                    lines={[
+                      { dataKey: "fob", name: "FOB (US$)", color: "#111" },
+                      { dataKey: "kg", name: "KG", color: "#666" },
+                    ]}
+                  />
+                </div>
 
-              <SimpleLineChart
-                title="Série anual – Preço médio (US$/t)"
-                data={annualPriceSeries}
-                xAxisKey="name"
-                yAxisLabel="US$/t"
-                lines={[{ dataKey: "usdPerTon", name: "US$/t", color: "#111" }]}
-              />
+                <div style={{ minWidth: 0 }}>
+                  <SimpleLineChart
+                    title="Série anual – Preço médio (US$/t)"
+                    data={annualPriceSeries}
+                    xAxisKey="name"
+                    yAxisLabel="US$/t"
+                    lines={[
+                      { dataKey: "usdPerTon", name: "US$/t", color: "#111" },
+                    ]}
+                  />
+                </div>
 
-              <SimpleBarChart
-                title="Composição por Categoria (FOB) – Top 20"
-                data={categoryBars}
-                xAxisKey="name"
-                dataKey="fob"
-                yAxisLabel="FOB (US$)"
-                barName="FOB"
-                showLegend={false}
-              />
+                <div style={{ minWidth: 0 }}>
+                  <SimpleBarChart
+                    title="Composição por Categoria (FOB) – Top 20"
+                    data={categoryBars}
+                    xAxisKey="name"
+                    dataKey="fob"
+                    yAxisLabel="FOB (US$)"
+                    barName="FOB"
+                    showLegend={false}
+                  />
+                </div>
 
-              <SimpleBarChart
-                title="Composição por Subcategoria (FOB) – Top 25"
-                data={subcatBars}
-                xAxisKey="name"
-                dataKey="fob"
-                yAxisLabel="FOB (US$)"
-                barName="FOB"
-                showLegend={false}
-              />
+                <div style={{ minWidth: 0 }}>
+                  <SimpleBarChart
+                    title="Composição por Subcategoria (FOB) – Top 25"
+                    data={subcatBars}
+                    xAxisKey="name"
+                    dataKey="fob"
+                    yAxisLabel="FOB (US$)"
+                    barName="FOB"
+                    showLegend={false}
+                  />
+                </div>
+              </div>
+
+              {/* ✅ Rodapé padrão do NCM */}
+              <div style={sourceFooterStyle}>
+                Fonte: Comex Stat/MDIC. Elaboração própria.
+              </div>
             </>
           )}
         </div>
