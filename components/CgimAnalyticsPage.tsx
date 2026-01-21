@@ -623,42 +623,48 @@ export default function CgimAnalyticsPage() {
     return subs.length ? `${entity} • ${catLabel} • ${subLabel}` : `${entity} • ${catLabel}`;
   }, [entity, selectedCategories, selectedSubcategories]);
 
+  // ✅ Série derivada para a balança: importações negativas (para ficar abaixo do eixo zero)
+  // (Não altera a lógica de dados — apenas a representação visual no gráfico.)
+  const annualBalanceSeriesSigned = React.useMemo(() => {
+    return (annualBalanceSeries || []).map((d) => ({
+      ...d,
+      exportFobPos: Math.abs(Number((d as any).exportFob ?? 0)),
+      importFobNeg: -Math.abs(Number((d as any).importFob ?? 0)),
+    }));
+  }, [annualBalanceSeries]);
+
+  // ✅ Domínio simétrico em torno de zero, para o gráfico de balança (barras + linha)
+  const balanceMaxAbs = React.useMemo(() => {
+    let max = 0;
+    for (const d of annualBalanceSeriesSigned) {
+      const a = Math.abs(Number((d as any).exportFobPos ?? 0));
+      const b = Math.abs(Number((d as any).importFobNeg ?? 0));
+      const c = Math.abs(Number((d as any).balanceFob ?? 0));
+      max = Math.max(max, a, b, c);
+    }
+    if (!Number.isFinite(max) || max <= 0) return 1;
+    return max * 1.15;
+  }, [annualBalanceSeriesSigned]);
+
+
   const tickFob = React.useCallback((v: any) => formatMoneyUS(Number(v) || 0), []);
   const tickKg = React.useCallback((v: any) => formatKg(Number(v) || 0), []);
   const tickPrice = React.useCallback((v: any) => formatUsdPerTon(Number(v) || 0), []);
-
-  // ✅ Para o gráfico de balança: importações devem aparecer abaixo do eixo (valores negativos)
-  // (apenas apresentação — não altera a lógica/serviços de dados)
-  const annualBalanceChartData = React.useMemo(() => {
-    return (annualBalanceSeries || []).map((r: any) => {
-      const exp = Number(r?.exportFob) || 0;
-      const imp = Number(r?.importFob) || 0;
-      const bal = Number(r?.balanceFob) || 0;
-      return {
-        ...r,
-        exportFob: exp,
-        // força importação como negativa para desenhar "para baixo"
-        importFobNeg: -Math.abs(imp),
-        balanceFob: bal,
-      };
-    });
-  }, [annualBalanceSeries]);
-
-  // ✅ Domínio simétrico no Y para destacar exportações (acima) e importações (abaixo)
-  const annualBalanceDomain = React.useMemo<[number, number]>(() => {
-    let maxAbs = 0;
-    for (const r of annualBalanceChartData) {
-      const exp = Math.abs(Number(r?.exportFob) || 0);
-      const imp = Math.abs(Number(r?.importFobNeg) || 0);
-      const bal = Math.abs(Number(r?.balanceFob) || 0);
-      maxAbs = Math.max(maxAbs, exp, imp, bal);
-    }
-    if (!maxAbs || !Number.isFinite(maxAbs)) return [0, 0];
-    // respiro de 10%
-    const padded = maxAbs * 1.1;
-    return [-padded, padded];
-  }, [annualBalanceChartData]);
   return (
+    <>
+      <style>{`
+        .cgimAnnualGrid2 {
+          display: grid;
+          grid-template-columns: repeat(2, minmax(0, 1fr));
+          gap: 12px;
+          align-items: stretch;
+        }
+        @media (max-width: 1100px) {
+          .cgimAnnualGrid2 {
+            grid-template-columns: 1fr;
+          }
+        }
+      `}</style>
     <div
       style={{ padding: 18, display: "flex", flexDirection: "column", gap: 14 }}
     >
@@ -1046,14 +1052,7 @@ export default function CgimAnalyticsPage() {
               </div>
 
               {/* ✅ 2×2 (desktop) / 1 por linha (mobile): exatamente como o padrão do módulo NCM */}
-              <div
-                style={{
-                  display: "grid",
-                  gridTemplateColumns: "1fr",
-                  gap: 12,
-                  alignItems: "stretch",
-                }}
-              >
+              <div className="cgimAnnualGrid2">
                 <div
                   style={{
                     border: "1px solid #e6e6e6",
@@ -1077,12 +1076,10 @@ export default function CgimAnalyticsPage() {
 
                     <div style={{ padding: "0 6px 12px 6px" }}>
                       <ResponsiveContainer width="100%" height={320}>
-                        <BarChart data={annualImportSeries} barSize={28} barCategoryGap="20%" barGap={6} margin={{ top: 10, right: 20, left: 60, bottom: 10 }}>
+                        <BarChart data={annualImportSeries} barSize={42} barCategoryGap="10%" barGap={2} margin={{ top: 10, right: 20, left: 54, bottom: 10 }}>
                           <CartesianGrid strokeDasharray="3 3" />
                           <XAxis dataKey="name" />
-                          <YAxis
-                            tickFormatter={tickKg}
-                          />
+                          <YAxis tickFormatter={tickKg} domain={[0, (dataMax: number) => Math.max(0, dataMax) * 1.1]} />
                           <Tooltip
                             formatter={(value: any) => tickKg(value)}
                             labelFormatter={(label) => `Ano: ${label}`}
@@ -1126,12 +1123,12 @@ export default function CgimAnalyticsPage() {
 
                     <div style={{ padding: "0 6px 12px 6px" }}>
                       <ResponsiveContainer width="100%" height={320}>
-                        <BarChart data={annualImportSeries} barSize={28} barCategoryGap="20%" barGap={6} margin={{ top: 10, right: 20, left: 60, bottom: 10 }}>
+                        <BarChart data={annualImportSeries} barSize={42} barCategoryGap="10%" barGap={2} margin={{ top: 10, right: 20, left: 54, bottom: 10 }}>
                           <CartesianGrid strokeDasharray="3 3" />
                           <XAxis dataKey="name" />
-                          <YAxis tickFormatter={tickFob} domain={annualBalanceDomain} />
+                          <YAxis tickFormatter={tickFob} domain={[0, (dataMax: number) => Math.max(0, dataMax) * 1.1]} />
                           <Tooltip
-                            formatter={(value: any, name: any) => (name === "Importação" ? tickFob(Math.abs(Number(value) || 0)) : tickFob(Number(value) || 0))}
+                            formatter={(value: any) => tickFob(value)}
                             labelFormatter={(label) => `Ano: ${label}`}
                           />
                           <Legend />
@@ -1173,12 +1170,10 @@ export default function CgimAnalyticsPage() {
 
                     <div style={{ padding: "0 6px 12px 6px" }}>
                       <ResponsiveContainer width="100%" height={320}>
-                        <BarChart data={annualExportSeries} barSize={28} barCategoryGap="20%" barGap={6} margin={{ top: 10, right: 20, left: 60, bottom: 10 }}>
+                        <BarChart data={annualExportSeries} barSize={42} barCategoryGap="10%" barGap={2} margin={{ top: 10, right: 20, left: 54, bottom: 10 }}>
                           <CartesianGrid strokeDasharray="3 3" />
                           <XAxis dataKey="name" />
-                          <YAxis
-                            tickFormatter={tickKg}
-                          />
+                          <YAxis tickFormatter={tickKg} domain={[0, (dataMax: number) => Math.max(0, dataMax) * 1.1]} />
                           <Tooltip
                             formatter={(value: any) => tickKg(value)}
                             labelFormatter={(label) => `Ano: ${label}`}
@@ -1222,12 +1217,10 @@ export default function CgimAnalyticsPage() {
 
                     <div style={{ padding: "0 6px 12px 6px" }}>
                       <ResponsiveContainer width="100%" height={320}>
-                        <BarChart data={annualExportSeries} barSize={28} barCategoryGap="20%" barGap={6} margin={{ top: 10, right: 20, left: 60, bottom: 10 }}>
+                        <BarChart data={annualExportSeries} barSize={42} barCategoryGap="10%" barGap={2} margin={{ top: 10, right: 20, left: 54, bottom: 10 }}>
                           <CartesianGrid strokeDasharray="3 3" />
                           <XAxis dataKey="name" />
-                          <YAxis
-                            tickFormatter={tickFob}
-                          />
+                          <YAxis tickFormatter={tickFob} domain={[0, (dataMax: number) => Math.max(0, dataMax) * 1.1]} />
                           <Tooltip
                             formatter={(value: any) => tickFob(value)}
                             labelFormatter={(label) => `Ano: ${label}`}
@@ -1252,14 +1245,7 @@ export default function CgimAnalyticsPage() {
               <div style={{ height: 12 }} />
 
               {/* ✅ Preço médio (Import vs Export) + Balança (Import + Export + linha) */}
-              <div
-                style={{
-                  display: "grid",
-                  gridTemplateColumns: "1fr",
-                  gap: 12,
-                  alignItems: "stretch",
-                }}
-              >
+              <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
                 <div
                   style={{
                     border: "1px solid #e6e6e6",
@@ -1283,7 +1269,7 @@ export default function CgimAnalyticsPage() {
 
                     <div style={{ padding: "0 6px 12px 6px" }}>
                       <ResponsiveContainer width="100%" height={320}>
-                        <LineChart data={annualPriceIeSeries} margin={{ top: 10, right: 20, left: 60, bottom: 10 }}>
+                        <LineChart data={annualPriceIeSeries} margin={{ top: 10, right: 20, left: 54, bottom: 10 }}>
                           <CartesianGrid strokeDasharray="3 3" />
                           <XAxis dataKey="name" />
                           <YAxis
@@ -1343,23 +1329,23 @@ export default function CgimAnalyticsPage() {
                     <div style={{ padding: "0 6px 12px 6px" }}>
                       <ResponsiveContainer width="100%" height={320}>
                         <ComposedChart
-                          data={annualBalanceChartData}
-                          margin={{ top: 10, right: 20, left: 60, bottom: 10 }}
-                          barSize={26}
-                          barCategoryGap="18%"
-                          barGap={6}
+                          data={annualBalanceSeriesSigned}
+                          margin={{ top: 10, right: 20, left: 54, bottom: 10 }}
+                          barSize={24}
+                          barCategoryGap="26%"
+                          barGap={2}
                         >
                           <CartesianGrid strokeDasharray="3 3" />
                           <XAxis dataKey="name" />
-                          <YAxis tickFormatter={tickFob} domain={annualBalanceDomain} />
+                          <YAxis tickFormatter={tickFob} domain={[-balanceMaxAbs, balanceMaxAbs]} />
                           <Tooltip
-                            formatter={(value: any, name: any) => (name === "Importação" ? tickFob(Math.abs(Number(value) || 0)) : tickFob(Number(value) || 0))}
+                            formatter={(value: any) => tickFob(value)}
                             labelFormatter={(label) => `Ano: ${label}`}
                           />
                           <Legend />
                           <ReferenceLine y={0} stroke="#111" strokeWidth={2} />
                           <Bar
-                            dataKey="exportFob"
+                            dataKey="exportFobPos"
                             name="Exportação"
                             fill="#3b82f6"
                             radius={[6, 6, 0, 0]}
@@ -1397,14 +1383,7 @@ export default function CgimAnalyticsPage() {
               <div style={{ height: 12 }} />
 
               {/* Mantém os gráficos de composição por categoria/subcategoria */}
-              <div
-                style={{
-                  display: "grid",
-                  gridTemplateColumns: "1fr",
-                  gap: 12,
-                  alignItems: "stretch",
-                }}
-              >
+              <div className="cgimAnnualGrid2">
                 <SimpleBarChart
                   title="Composição por Categoria (FOB) — Top 20"
                   data={categoryBars}
@@ -1477,5 +1456,6 @@ export default function CgimAnalyticsPage() {
         </div>
       )}
     </div>
+    </>
   );
 }
