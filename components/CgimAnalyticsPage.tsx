@@ -1,8 +1,23 @@
 // components/CgimAnalyticsPage.tsx
 import React from "react";
+import Section from "./Section";
 import { CgimHierarchyTable } from "./CgimHierarchyTable";
 import SimpleLineChart from "./charts/SimpleLineChart";
 import SimpleBarChart from "./charts/SimpleBarChart";
+import {
+  ResponsiveContainer,
+  BarChart,
+  Bar,
+  LineChart,
+  Line,
+  CartesianGrid,
+  XAxis,
+  YAxis,
+  Tooltip,
+  Legend,
+  ReferenceLine,
+  ComposedChart,
+} from "recharts";
 
 import {
   buildHierarchyTree,
@@ -150,6 +165,11 @@ export default function CgimAnalyticsPage() {
   const [chartsLoading, setChartsLoading] = React.useState(false);
   const [chartsError, setChartsError] = React.useState<string | null>(null);
   const [annualSeries, setAnnualSeries] = React.useState<any[]>([]);
+  // ✅ séries anuais separadas (padrão NCM: import/export separados)
+  const [annualImportSeries, setAnnualImportSeries] = React.useState<any[]>([]);
+  const [annualExportSeries, setAnnualExportSeries] = React.useState<any[]>([]);
+  const [annualBalanceSeries, setAnnualBalanceSeries] = React.useState<any[]>([]);
+  const [annualPriceIeSeries, setAnnualPriceIeSeries] = React.useState<any[]>([]);
   const [annualPriceSeries, setAnnualPriceSeries] = React.useState<any[]>([]);
   const [categoryBars, setCategoryBars] = React.useState<any[]>([]);
   const [subcatBars, setSubcatBars] = React.useState<any[]>([]);
@@ -373,20 +393,19 @@ export default function CgimAnalyticsPage() {
     let cancelled = false;
     let t: any = null;
 
-    // ✅ UI/UX: liga o loading IMEDIATAMENTE ao mudar filtros (evita “tela congelada” no debounce)
-    setChartsLoading(true);
-    setChartsError(null);
-
     async function runCharts() {
-      try {
-        if (!dictRowsAll.length) {
-          setAnnualSeries([]);
-          setAnnualPriceSeries([]);
-          setCategoryBars([]);
-          setSubcatBars([]);
-          return;
-        }
+      if (!dictRowsAll.length) {
+        setAnnualSeries([]);
+        setAnnualPriceSeries([]);
+        setCategoryBars([]);
+        setSubcatBars([]);
+        return;
+      }
 
+      setChartsLoading(true);
+      setChartsError(null);
+
+      try {
         const ncms = collectNcmsFromDictionary({
           dictRowsAll,
           selectedCategories,
@@ -401,34 +420,74 @@ export default function CgimAnalyticsPage() {
           return;
         }
 
-        const yearStart = 2015;
+        const yearStart = 2010;
         const yearEnd = 2025;
 
-        const series = await fetchBasketAnnualSeries({
-          flow,
-          yearStart,
-          yearEnd,
-          ncms,
-          useCache: true,
-          cacheTtlHours: 24,
-        });
+        // ✅ Padrão NCM: séries anuais separadas para Importação e Exportação
+        const [impSeriesRaw, expSeriesRaw] = await Promise.all([
+          fetchBasketAnnualSeries({
+            flow: "import",
+            yearStart,
+            yearEnd,
+            ncms,
+            useCache: true,
+            cacheTtlHours: 24,
+          }),
+          fetchBasketAnnualSeries({
+            flow: "export",
+            yearStart,
+            yearEnd,
+            ncms,
+            useCache: true,
+            cacheTtlHours: 24,
+          }),
+        ]);
 
         if (cancelled) return;
 
-        setAnnualSeries(
-          series.map((p) => ({
-            name: String(p.year),
-            fob: p.fob,
-            kg: p.kg,
-          }))
-        );
+        const impSeries = impSeriesRaw.map((p) => ({
+          name: String(p.year),
+          fob: p.fob,
+          kg: p.kg,
+          usdPerTon: p.usdPerTon,
+        }));
+        const expSeries = expSeriesRaw.map((p) => ({
+          name: String(p.year),
+          fob: p.fob,
+          kg: p.kg,
+          usdPerTon: p.usdPerTon,
+        }));
 
-        setAnnualPriceSeries(
-          series.map((p) => ({
-            name: String(p.year),
-            usdPerTon: p.usdPerTon,
-          }))
-        );
+        // Mantém annualSeries (legado) como importação para não quebrar usos existentes
+        setAnnualSeries(impSeries.map((p) => ({ name: p.name, fob: p.fob, kg: p.kg })));
+        setAnnualImportSeries(impSeries.map((p) => ({ name: p.name, fob: p.fob, kg: p.kg })));
+        setAnnualExportSeries(expSeries.map((p) => ({ name: p.name, fob: p.fob, kg: p.kg })));
+
+        // Preço médio: Importação vs Exportação no mesmo dataset por ano
+        const byYear = new Map<string, { importPrice?: number; exportPrice?: number; importFob?: number; exportFob?: number }>();
+        for (const p of impSeries) {
+          byYear.set(p.name, { ...(byYear.get(p.name) || {}), importPrice: p.usdPerTon, importFob: p.fob });
+        }
+        for (const p of expSeries) {
+          byYear.set(p.name, { ...(byYear.get(p.name) || {}), exportPrice: p.usdPerTon, exportFob: p.fob });
+        }
+        const yearsSorted = Array.from(byYear.keys()).sort((a, b) => Number(a) - Number(b));
+
+        const priceIE = yearsSorted.map((y) => ({
+          name: y,
+          importPrice: byYear.get(y)?.importPrice ?? 0,
+          exportPrice: byYear.get(y)?.exportPrice ?? 0,
+        }));
+        setAnnualPriceIeSeries(priceIE);
+        // Mantém annualPriceSeries (legado) apontando para a mesma série (não quebra)
+        setAnnualPriceSeries(priceIE.map((p) => ({ name: p.name, usdPerTon: p.importPrice })));
+
+        const balance = yearsSorted.map((y) => {
+          const ex = byYear.get(y)?.exportFob ?? 0;
+          const im = byYear.get(y)?.importFob ?? 0;
+          return { name: y, exportFob: ex, importFob: im, balanceFob: ex - im };
+        });
+        setAnnualBalanceSeries(balance);
 
         // barras usando a árvore (com seed), ok
         const catSet = new Set((selectedCategories || []).filter(Boolean));
@@ -466,7 +525,6 @@ export default function CgimAnalyticsPage() {
       }
     }
 
-    // Mantém o debounce (mínimo), mas sem “tela congelada” pois loading liga antes
     t = setTimeout(runCharts, 250);
     return () => {
       cancelled = true;
@@ -491,15 +549,20 @@ export default function CgimAnalyticsPage() {
     setSelectedSubcategories([]);
   }, []);
 
-  // ✅ Card padrão (mais próximo do NCM): borda + sombra suave (sem alterar lógica)
   const cardStyle: React.CSSProperties = {
     border: "1px solid #e6e6e6",
     borderRadius: 12,
     padding: 14,
     background: "#fff",
-    boxShadow: "0 4px 14px rgba(0,0,0,0.06)",
   };
 
+  // Rodapé padrão (igual ao módulo NCM)
+  const sourceFooterStyle: React.CSSProperties = {
+    marginTop: 10,
+    fontSize: 12,
+    opacity: 0.7,
+    textAlign: "center",
+  };
   const labelStyle: React.CSSProperties = {
     fontSize: 12,
     opacity: 0.7,
@@ -534,53 +597,71 @@ export default function CgimAnalyticsPage() {
     minHeight: 260,
   };
 
-  // ✅ TAREFA 1: Grid 2×2 idêntico ao NCM para os 4 gráficos anuais
-  const chartGridStyle: React.CSSProperties = {
-    display: "grid",
-    gridTemplateColumns: "repeat(2, minmax(0, 1fr))",
-    gap: 12,
-    alignItems: "stretch",
-  };
-
-  // ✅ Rodapé padrão (Fonte…)
-  const sourceFooterStyle: React.CSSProperties = {
-    marginTop: 10,
-    fontSize: 12,
-    opacity: 0.7,
-    textAlign: "center",
-  };
-
-  // ✅ TAREFA 2: barra sticky volta a cobrir TABELA e GRÁFICOS
+  // ✅ AQUI: barra sticky volta a cobrir TABELA e GRÁFICOS
   const showTopLoading = loading || chartsLoading;
   const topLoadingTitle = loading ? "Carregando tabela…" : "Carregando gráficos…";
   const hasProgress = !!(progress && progress.total);
   const pct = hasProgress
-    ? Math.max(
-        0,
-        Math.min(100, Math.round((progress!.done / progress!.total) * 100))
-      )
+    ? Math.max(0, Math.min(100, Math.round((progress!.done / progress!.total) * 100)))
     : 0;
 
+
+  // ✅ Identificador curto da cesta atual (para títulos dos gráficos)
+  const basketLabel = React.useMemo(() => {
+    const cats = (selectedCategories || []).filter(Boolean);
+    const subs = (selectedSubcategories || []).filter(Boolean);
+
+    const fmtList = (arr: string[], max = 3) => {
+      if (!arr.length) return "Todas";
+      const head = arr.slice(0, max).join(", ");
+      const tail = arr.length > max ? ` +${arr.length - max}` : "";
+      return head + tail;
+    };
+
+    const catLabel = fmtList(cats, 3);
+    const subLabel = fmtList(subs, 2);
+    return subs.length ? `${entity} • ${catLabel} • ${subLabel}` : `${entity} • ${catLabel}`;
+  }, [entity, selectedCategories, selectedSubcategories]);
+
+  const tickFob = React.useCallback((v: any) => formatMoneyUS(Number(v) || 0), []);
+  const tickKg = React.useCallback((v: any) => formatKg(Number(v) || 0), []);
+  const tickPrice = React.useCallback((v: any) => formatUsdPerTon(Number(v) || 0), []);
+
+  // ✅ Para o gráfico de balança: importações devem aparecer abaixo do eixo (valores negativos)
+  // (apenas apresentação — não altera a lógica/serviços de dados)
+  const annualBalanceChartData = React.useMemo(() => {
+    return (annualBalanceSeries || []).map((r: any) => {
+      const exp = Number(r?.exportFob) || 0;
+      const imp = Number(r?.importFob) || 0;
+      const bal = Number(r?.balanceFob) || 0;
+      return {
+        ...r,
+        exportFob: exp,
+        // força importação como negativa para desenhar "para baixo"
+        importFobNeg: -Math.abs(imp),
+        balanceFob: bal,
+      };
+    });
+  }, [annualBalanceSeries]);
+
+  // ✅ Domínio simétrico no Y para destacar exportações (acima) e importações (abaixo)
+  const annualBalanceDomain = React.useMemo<[number, number]>(() => {
+    let maxAbs = 0;
+    for (const r of annualBalanceChartData) {
+      const exp = Math.abs(Number(r?.exportFob) || 0);
+      const imp = Math.abs(Number(r?.importFobNeg) || 0);
+      const bal = Math.abs(Number(r?.balanceFob) || 0);
+      maxAbs = Math.max(maxAbs, exp, imp, bal);
+    }
+    if (!maxAbs || !Number.isFinite(maxAbs)) return [0, 0];
+    // respiro de 10%
+    const padded = maxAbs * 1.1;
+    return [-padded, padded];
+  }, [annualBalanceChartData]);
   return (
     <div
       style={{ padding: 18, display: "flex", flexDirection: "column", gap: 14 }}
     >
-      {/* ✅ CSS local p/ responsividade do grid dos gráficos (2 col desktop, 1 col mobile) */}
-      <style>
-        {`
-          @media (max-width: 900px) {
-            .cgim-annual-grid {
-              grid-template-columns: 1fr !important;
-            }
-          }
-          @keyframes cgim-indeterminate {
-            0% { transform: translateX(-120%); opacity: 0.6; }
-            50% { opacity: 1; }
-            100% { transform: translateX(320%); opacity: 0.6; }
-          }
-        `}
-      </style>
-
       {showTopLoading && (
         <div
           style={{
@@ -588,6 +669,7 @@ export default function CgimAnalyticsPage() {
             position: "sticky",
             top: 10,
             zIndex: 50,
+            boxShadow: "0 4px 14px rgba(0,0,0,0.06)",
           }}
         >
           <div
@@ -637,6 +719,16 @@ export default function CgimAnalyticsPage() {
               />
             )}
           </div>
+
+          <style>
+            {`
+              @keyframes cgim-indeterminate {
+                0% { transform: translateX(-120%); opacity: 0.6; }
+                50% { opacity: 1; }
+                100% { transform: translateX(320%); opacity: 0.6; }
+              }
+            `}
+          </style>
         </div>
       )}
 
@@ -927,7 +1019,9 @@ export default function CgimAnalyticsPage() {
               marginBottom: 10,
             }}
           >
-            <div style={{ fontWeight: 900 }}>Gráficos da cesta (recorte atual)</div>
+            <div style={{ fontWeight: 900 }}>
+              Gráficos Anuais (Comex Stat)
+            </div>
             <div style={{ fontSize: 12, opacity: 0.7 }}>
               {chartsLoading ? "Carregando…" : "OK"}
             </div>
@@ -945,67 +1039,394 @@ export default function CgimAnalyticsPage() {
             </div>
           )}
 
-          {!!annualSeries.length && (
+          {!!annualImportSeries.length && (
             <>
-              {/* ✅ TAREFA 1: 4 cards em grid 2×2 (desktop) e 1×4 (mobile) */}
-              <div className="cgim-annual-grid" style={chartGridStyle}>
-                <div style={{ minWidth: 0 }}>
-                  <SimpleLineChart
-                    title="Série anual – FOB e KG (cesta agregada)"
-                    data={annualSeries}
-                    xAxisKey="name"
-                    yAxisLabel="FOB / KG"
-                    lines={[
-                      { dataKey: "fob", name: "FOB (US$)", color: "#111" },
-                      { dataKey: "kg", name: "KG", color: "#666" },
-                    ]}
-                  />
+              <div style={{ fontSize: 12, opacity: 0.75, marginBottom: 10 }}>
+                Cesta exibida: <strong>{basketLabel}</strong>
+              </div>
+
+              {/* ✅ 2×2 (desktop) / 1 por linha (mobile): exatamente como o padrão do módulo NCM */}
+              <div
+                style={{
+                  display: "grid",
+                  gridTemplateColumns: "1fr",
+                  gap: 12,
+                  alignItems: "stretch",
+                }}
+              >
+                <div
+                  style={{
+                    border: "1px solid #e6e6e6",
+                    borderRadius: 12,
+                    background: "#fff",
+                    boxShadow: "0 10px 22px rgba(0,0,0,0.12)",
+                    overflow: "hidden",
+                  }}
+                >
+                  <div style={{ padding: "14px 14px 0 14px" }}>
+                    <div
+                      style={{
+                        fontWeight: 900,
+                        fontSize: 18,
+                        textAlign: "center",
+                        marginBottom: 8,
+                      }}
+                    >
+                      Importações (KG) — {basketLabel}
+                    </div>
+
+                    <div style={{ padding: "0 6px 12px 6px" }}>
+                      <ResponsiveContainer width="100%" height={320}>
+                        <BarChart data={annualImportSeries} barSize={28} barCategoryGap="20%" barGap={6} margin={{ top: 10, right: 20, left: 60, bottom: 10 }}>
+                          <CartesianGrid strokeDasharray="3 3" />
+                          <XAxis dataKey="name" />
+                          <YAxis
+                            tickFormatter={tickKg}
+                          />
+                          <Tooltip
+                            formatter={(value: any) => tickKg(value)}
+                            labelFormatter={(label) => `Ano: ${label}`}
+                          />
+                          <Legend />
+                          <Bar
+                            dataKey="kg"
+                            name="Importações (KG)"
+                            fill="#f59e0b"
+                            radius={[6, 6, 0, 0]}
+                          />
+                        </BarChart>
+                      </ResponsiveContainer>
+                    </div>
+                  </div>
+                  <div style={sourceFooterStyle}>
+                    Fonte: Comex Stat/MDIC. Elaboração própria.
+                  </div>
                 </div>
 
-                <div style={{ minWidth: 0 }}>
-                  <SimpleLineChart
-                    title="Série anual – Preço médio (US$/t)"
-                    data={annualPriceSeries}
-                    xAxisKey="name"
-                    yAxisLabel="US$/t"
-                    lines={[
-                      { dataKey: "usdPerTon", name: "US$/t", color: "#111" },
-                    ]}
-                  />
+                <div
+                  style={{
+                    border: "1px solid #e6e6e6",
+                    borderRadius: 12,
+                    background: "#fff",
+                    boxShadow: "0 10px 22px rgba(0,0,0,0.12)",
+                    overflow: "hidden",
+                  }}
+                >
+                  <div style={{ padding: "14px 14px 0 14px" }}>
+                    <div
+                      style={{
+                        fontWeight: 900,
+                        fontSize: 18,
+                        textAlign: "center",
+                        marginBottom: 8,
+                      }}
+                    >
+                      Importações (US$ FOB) — {basketLabel}
+                    </div>
+
+                    <div style={{ padding: "0 6px 12px 6px" }}>
+                      <ResponsiveContainer width="100%" height={320}>
+                        <BarChart data={annualImportSeries} barSize={28} barCategoryGap="20%" barGap={6} margin={{ top: 10, right: 20, left: 60, bottom: 10 }}>
+                          <CartesianGrid strokeDasharray="3 3" />
+                          <XAxis dataKey="name" />
+                          <YAxis tickFormatter={tickFob} domain={annualBalanceDomain} />
+                          <Tooltip
+                            formatter={(value: any, name: any) => (name === "Importação" ? tickFob(Math.abs(Number(value) || 0)) : tickFob(Number(value) || 0))}
+                            labelFormatter={(label) => `Ano: ${label}`}
+                          />
+                          <Legend />
+                          <Bar
+                            dataKey="fob"
+                            name="Importações (US$ FOB)"
+                            fill="#f59e0b"
+                            radius={[6, 6, 0, 0]}
+                          />
+                        </BarChart>
+                      </ResponsiveContainer>
+                    </div>
+                  </div>
+                  <div style={sourceFooterStyle}>
+                    Fonte: Comex Stat/MDIC. Elaboração própria.
+                  </div>
                 </div>
 
-                <div style={{ minWidth: 0 }}>
-                  <SimpleBarChart
-                    title="Composição por Categoria (FOB) – Top 20"
-                    data={categoryBars}
-                    xAxisKey="name"
-                    dataKey="fob"
-                    yAxisLabel="FOB (US$)"
-                    barName="FOB"
-                    showLegend={false}
-                  />
+                <div
+                  style={{
+                    border: "1px solid #e6e6e6",
+                    borderRadius: 12,
+                    background: "#fff",
+                    boxShadow: "0 10px 22px rgba(0,0,0,0.12)",
+                    overflow: "hidden",
+                  }}
+                >
+                  <div style={{ padding: "14px 14px 0 14px" }}>
+                    <div
+                      style={{
+                        fontWeight: 900,
+                        fontSize: 18,
+                        textAlign: "center",
+                        marginBottom: 8,
+                      }}
+                    >
+                      Exportações (KG) — {basketLabel}
+                    </div>
+
+                    <div style={{ padding: "0 6px 12px 6px" }}>
+                      <ResponsiveContainer width="100%" height={320}>
+                        <BarChart data={annualExportSeries} barSize={28} barCategoryGap="20%" barGap={6} margin={{ top: 10, right: 20, left: 60, bottom: 10 }}>
+                          <CartesianGrid strokeDasharray="3 3" />
+                          <XAxis dataKey="name" />
+                          <YAxis
+                            tickFormatter={tickKg}
+                          />
+                          <Tooltip
+                            formatter={(value: any) => tickKg(value)}
+                            labelFormatter={(label) => `Ano: ${label}`}
+                          />
+                          <Legend />
+                          <Bar
+                            dataKey="kg"
+                            name="Exportações (KG)"
+                            fill="#3b82f6"
+                            radius={[6, 6, 0, 0]}
+                          />
+                        </BarChart>
+                      </ResponsiveContainer>
+                    </div>
+                  </div>
+                  <div style={sourceFooterStyle}>
+                    Fonte: Comex Stat/MDIC. Elaboração própria.
+                  </div>
                 </div>
 
-                <div style={{ minWidth: 0 }}>
-                  <SimpleBarChart
-                    title="Composição por Subcategoria (FOB) – Top 25"
-                    data={subcatBars}
-                    xAxisKey="name"
-                    dataKey="fob"
-                    yAxisLabel="FOB (US$)"
-                    barName="FOB"
-                    showLegend={false}
-                  />
+                <div
+                  style={{
+                    border: "1px solid #e6e6e6",
+                    borderRadius: 12,
+                    background: "#fff",
+                    boxShadow: "0 10px 22px rgba(0,0,0,0.12)",
+                    overflow: "hidden",
+                  }}
+                >
+                  <div style={{ padding: "14px 14px 0 14px" }}>
+                    <div
+                      style={{
+                        fontWeight: 900,
+                        fontSize: 18,
+                        textAlign: "center",
+                        marginBottom: 8,
+                      }}
+                    >
+                      Exportações (US$ FOB) — {basketLabel}
+                    </div>
+
+                    <div style={{ padding: "0 6px 12px 6px" }}>
+                      <ResponsiveContainer width="100%" height={320}>
+                        <BarChart data={annualExportSeries} barSize={28} barCategoryGap="20%" barGap={6} margin={{ top: 10, right: 20, left: 60, bottom: 10 }}>
+                          <CartesianGrid strokeDasharray="3 3" />
+                          <XAxis dataKey="name" />
+                          <YAxis
+                            tickFormatter={tickFob}
+                          />
+                          <Tooltip
+                            formatter={(value: any) => tickFob(value)}
+                            labelFormatter={(label) => `Ano: ${label}`}
+                          />
+                          <Legend />
+                          <Bar
+                            dataKey="fob"
+                            name="Exportações (US$ FOB)"
+                            fill="#3b82f6"
+                            radius={[6, 6, 0, 0]}
+                          />
+                        </BarChart>
+                      </ResponsiveContainer>
+                    </div>
+                  </div>
+                  <div style={sourceFooterStyle}>
+                    Fonte: Comex Stat/MDIC. Elaboração própria.
+                  </div>
                 </div>
               </div>
 
-              {/* ✅ Rodapé padrão do NCM */}
-              <div style={sourceFooterStyle}>
-                Fonte: Comex Stat/MDIC. Elaboração própria.
+              <div style={{ height: 12 }} />
+
+              {/* ✅ Preço médio (Import vs Export) + Balança (Import + Export + linha) */}
+              <div
+                style={{
+                  display: "grid",
+                  gridTemplateColumns: "1fr",
+                  gap: 12,
+                  alignItems: "stretch",
+                }}
+              >
+                <div
+                  style={{
+                    border: "1px solid #e6e6e6",
+                    borderRadius: 12,
+                    background: "#fff",
+                    boxShadow: "0 10px 22px rgba(0,0,0,0.12)",
+                    overflow: "hidden",
+                  }}
+                >
+                  <div style={{ padding: "14px 14px 0 14px" }}>
+                    <div
+                      style={{
+                        fontWeight: 900,
+                        fontSize: 18,
+                        textAlign: "center",
+                        marginBottom: 8,
+                      }}
+                    >
+                      Preços Médios (US$/t) — Importação vs Exportação — {basketLabel}
+                    </div>
+
+                    <div style={{ padding: "0 6px 12px 6px" }}>
+                      <ResponsiveContainer width="100%" height={320}>
+                        <LineChart data={annualPriceIeSeries} margin={{ top: 10, right: 20, left: 60, bottom: 10 }}>
+                          <CartesianGrid strokeDasharray="3 3" />
+                          <XAxis dataKey="name" />
+                          <YAxis
+                            tickFormatter={tickPrice}
+                          />
+                          <Tooltip
+                            formatter={(value: any) => tickPrice(value)}
+                            labelFormatter={(label) => `Ano: ${label}`}
+                          />
+                          <Legend />
+                          <Line
+                            type="monotone"
+                            dataKey="importPrice"
+                            name="Preço Médio Importação (US$/t)"
+                            stroke="#ef4444"
+                            strokeWidth={2}
+                            dot={{ r: 4 }}
+                          />
+                          <Line
+                            type="monotone"
+                            dataKey="exportPrice"
+                            name="Preço Médio Exportação (US$/t)"
+                            stroke="#3b82f6"
+                            strokeWidth={2}
+                            dot={{ r: 4 }}
+                          />
+                        </LineChart>
+                      </ResponsiveContainer>
+                    </div>
+                  </div>
+                  <div style={sourceFooterStyle}>
+                    Fonte: Comex Stat/MDIC. Elaboração própria.
+                  </div>
+                </div>
+
+                <div
+                  style={{
+                    border: "1px solid #e6e6e6",
+                    borderRadius: 12,
+                    background: "#fff",
+                    boxShadow: "0 10px 22px rgba(0,0,0,0.12)",
+                    overflow: "hidden",
+                  }}
+                >
+                  <div style={{ padding: "14px 14px 0 14px" }}>
+                    <div
+                      style={{
+                        fontWeight: 900,
+                        fontSize: 18,
+                        textAlign: "center",
+                        marginBottom: 8,
+                      }}
+                    >
+                      Exportação, Importação e Balança Comercial (US$ FOB) — {basketLabel}
+                    </div>
+
+                    <div style={{ padding: "0 6px 12px 6px" }}>
+                      <ResponsiveContainer width="100%" height={320}>
+                        <ComposedChart
+                          data={annualBalanceChartData}
+                          margin={{ top: 10, right: 20, left: 60, bottom: 10 }}
+                          barSize={26}
+                          barCategoryGap="18%"
+                          barGap={6}
+                        >
+                          <CartesianGrid strokeDasharray="3 3" />
+                          <XAxis dataKey="name" />
+                          <YAxis tickFormatter={tickFob} domain={annualBalanceDomain} />
+                          <Tooltip
+                            formatter={(value: any, name: any) => (name === "Importação" ? tickFob(Math.abs(Number(value) || 0)) : tickFob(Number(value) || 0))}
+                            labelFormatter={(label) => `Ano: ${label}`}
+                          />
+                          <Legend />
+                          <ReferenceLine y={0} stroke="#111" strokeWidth={2} />
+                          <Bar
+                            dataKey="exportFob"
+                            name="Exportação"
+                            fill="#3b82f6"
+                            radius={[6, 6, 0, 0]}
+                          />
+                          <Bar
+                            dataKey="importFobNeg"
+                            name="Importação"
+                            fill="#ef4444"
+                            radius={[0, 0, 6, 6]}
+                          />
+                          <Line
+                            type="monotone"
+                            dataKey="balanceFob"
+                            name="Balança Comercial"
+                            stroke="#10b981"
+                            strokeWidth={3}
+                            dot={{ r: 5, fill: "#fff", stroke: "#10b981", strokeWidth: 2 }}
+                            activeDot={{
+                              r: 6,
+                              fill: "#fff",
+                              stroke: "#10b981",
+                              strokeWidth: 2,
+                            }}
+                          />
+                        </ComposedChart>
+                      </ResponsiveContainer>
+                    </div>
+                  </div>
+                  <div style={sourceFooterStyle}>
+                    Fonte: Comex Stat/MDIC. Elaboração própria.
+                  </div>
+                </div>
+              </div>
+
+              <div style={{ height: 12 }} />
+
+              {/* Mantém os gráficos de composição por categoria/subcategoria */}
+              <div
+                style={{
+                  display: "grid",
+                  gridTemplateColumns: "1fr",
+                  gap: 12,
+                  alignItems: "stretch",
+                }}
+              >
+                <SimpleBarChart
+                  title="Composição por Categoria (FOB) — Top 20"
+                  data={categoryBars}
+                  xAxisKey="name"
+                  dataKey="fob"
+                  yAxisLabel="FOB (US$)"
+                  barName="FOB"
+                  showLegend={false}
+                />
+
+                <SimpleBarChart
+                  title="Composição por Subcategoria (FOB) — Top 25"
+                  data={subcatBars}
+                  xAxisKey="name"
+                  dataKey="fob"
+                  yAxisLabel="FOB (US$)"
+                  barName="FOB"
+                  showLegend={false}
+                />
               </div>
             </>
-          )}
-        </div>
+          )}        </div>
       )}
 
       {(viewMode === "TABLE" || viewMode === "BOTH") && (
