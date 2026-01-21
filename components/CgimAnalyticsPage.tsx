@@ -1,9 +1,12 @@
 // components/CgimAnalyticsPage.tsx
 import React from "react";
 import Section from "./Section";
+import CgimStickyLoader from "./cgim/CgimStickyLoader";
+import CgimControlsPanel from "./cgim/CgimControlsPanel";
+import CgimAnnualChartsPanel from "./cgim/CgimAnnualChartsPanel";
 import { CgimHierarchyTable } from "./CgimHierarchyTable";
 import SimpleLineChart from "./charts/SimpleLineChart";
-import SimpleBarChart from "./charts/SimpleBarChart";
+import CompositionDonutChart from "./charts/CompositionDonutChart";
 import {
   ResponsiveContainer,
   BarChart,
@@ -173,7 +176,8 @@ export default function CgimAnalyticsPage() {
   const [annualPriceSeries, setAnnualPriceSeries] = React.useState<any[]>([]);
   const [categoryBars, setCategoryBars] = React.useState<any[]>([]);
   const [subcatBars, setSubcatBars] = React.useState<any[]>([]);
-
+  const [categoryBarsKg, setCategoryBarsKg] = React.useState<any[]>([]);
+  const [subcatBarsKg, setSubcatBarsKg] = React.useState<any[]>([]);
   const [diagnostics, setDiagnostics] = React.useState<{
     dictRows: number;
     distinctNcms: number;
@@ -398,7 +402,11 @@ export default function CgimAnalyticsPage() {
         setAnnualSeries([]);
         setAnnualPriceSeries([]);
         setCategoryBars([]);
-        setSubcatBars([]);
+          setSubcatBars([]);
+          setCategoryBarsKg([]);
+          setSubcatBarsKg([]);
+        setCategoryBarsKg([]);
+        setSubcatBarsKg([]);
         return;
       }
 
@@ -501,6 +509,14 @@ export default function CgimAnalyticsPage() {
         cats.sort((a, b) => (b.fob || 0) - (a.fob || 0));
         setCategoryBars(cats.slice(0, 20));
 
+        const catsKg: any[] = [];
+        for (const cat of tree) {
+          if (catSet.size && !catSet.has(cat.name)) continue;
+          catsKg.push({ name: cat.name, kg: cat.metrics.kg });
+        }
+        catsKg.sort((a, b) => (b.kg || 0) - (a.kg || 0));
+        setCategoryBarsKg(catsKg.slice(0, 20));
+
         const subs: any[] = [];
         for (const cat of tree) {
           if (catSet.size && !catSet.has(cat.name)) continue;
@@ -515,6 +531,21 @@ export default function CgimAnalyticsPage() {
         }
         subs.sort((a, b) => (b.fob || 0) - (a.fob || 0));
         setSubcatBars(subs.slice(0, 25));
+
+        const subsKg: any[] = [];
+        for (const cat of tree) {
+          if (catSet.size && !catSet.has(cat.name)) continue;
+          for (const sub of cat.children || []) {
+            if (sub.level !== "subcategory") continue;
+            if (subSet.size && !subSet.has(sub.name)) continue;
+            subsKg.push({
+              name: `${cat.name} • ${sub.name}`,
+              kg: sub.metrics.kg,
+            });
+          }
+        }
+        subsKg.sort((a, b) => (b.kg || 0) - (a.kg || 0));
+        setSubcatBarsKg(subsKg.slice(0, 25));
       } catch (e: any) {
         if (cancelled) return;
         setChartsError(
@@ -650,6 +681,31 @@ export default function CgimAnalyticsPage() {
   const tickFob = React.useCallback((v: any) => formatMoneyUS(Number(v) || 0), []);
   const tickKg = React.useCallback((v: any) => formatKg(Number(v) || 0), []);
   const tickPrice = React.useCallback((v: any) => formatUsdPerTon(Number(v) || 0), []);
+
+  // Aliases/formatters (mantém compatibilidade com o painel extraído)
+  const tickUsd = tickFob;
+  const tickUsdPerTon = tickPrice;
+  const tickUsdSigned = React.useCallback((v: any) => {
+    const n = Number(v) || 0;
+    const sign = n < 0 ? "-" : "";
+    return sign + formatMoneyUS(Math.abs(n));
+  }, []);
+
+
+// Textos explicativos (condensados) — lembrando que este módulo é sempre por ENTIDADE.
+// As "categorias" e "subcategorias" aqui são agrupamentos internos da cesta daquela entidade (e podem variar por entidade).
+const compositionCategoryTextFob =
+  "Mostra como o valor FOB total da cesta da entidade se distribui entre as categorias internas mapeadas no dicionário (por exemplo, famílias/linhas de produtos dentro daquela entidade). Ajuda a identificar rapidamente onde está a concentração do valor, se existe dependência de poucos grupos e quais categorias são residuais — útil para diagnósticos setoriais e priorização de análises.";
+
+const compositionSubcategoryTextFob =
+  "Mostra como o valor FOB total da cesta da entidade se distribui entre as subcategorias internas (níveis abaixo das categorias, quando existirem). Ajuda a enxergar quais segmentos específicos sustentam o valor, se há concentração em um único subconjunto e quais subcategorias relevantes ficam escondidas quando olhamos só a categoria — útil para direcionar investigações e recortes mais finos por NCM.";
+
+const compositionCategoryTextKg =
+  "Mostra como o volume (KG) total da cesta da entidade se distribui entre as categorias internas mapeadas no dicionário. Ajuda a identificar quais grupos concentram o volume, se existe dependência de poucos itens e quais categorias são residuais — útil para análises de escala, capacidade e exposição por volume.";
+
+const compositionSubcategoryTextKg =
+  "Mostra como o volume (KG) total da cesta da entidade se distribui entre as subcategorias internas (níveis abaixo das categorias, quando existirem). Ajuda a enxergar quais segmentos concentram o volume, se há concentração em um único subconjunto e quais subcategorias relevantes ficam escondidas quando olhamos só a categoria — útil para direcionar investigações e recortes mais finos por NCM.";
+
   return (
     <>
       <style>{`
@@ -668,75 +724,13 @@ export default function CgimAnalyticsPage() {
     <div
       style={{ padding: 18, display: "flex", flexDirection: "column", gap: 14 }}
     >
-      {showTopLoading && (
-        <div
-          style={{
-            ...cardStyle,
-            position: "sticky",
-            top: 10,
-            zIndex: 50,
-            boxShadow: "0 4px 14px rgba(0,0,0,0.06)",
-          }}
-        >
-          <div
-            style={{ display: "flex", justifyContent: "space-between", gap: 10 }}
-          >
-            <div style={{ fontWeight: 800 }}>{topLoadingTitle}</div>
-            <div style={{ fontSize: 12, opacity: 0.75 }}>
-              {hasProgress ? `${progress!.done}/${progress!.total}` : "—"}
-            </div>
-          </div>
-
-          <div
-            style={{
-              height: 8,
-              marginTop: 8,
-              borderRadius: 999,
-              background: "#e9e9e9",
-              overflow: "hidden",
-              position: "relative",
-            }}
-          >
-            {/* Determinada (tabela) */}
-            {hasProgress && (
-              <div
-                style={{
-                  height: "100%",
-                  width: `${pct}%`,
-                  background: "#111",
-                  transition: "width 200ms ease",
-                }}
-              />
-            )}
-
-            {/* Indeterminada (gráficos) */}
-            {!hasProgress && (
-              <div
-                style={{
-                  height: "100%",
-                  width: "35%",
-                  background: "#111",
-                  position: "absolute",
-                  left: 0,
-                  top: 0,
-                  borderRadius: 999,
-                  animation: "cgim-indeterminate 1.05s ease-in-out infinite",
-                }}
-              />
-            )}
-          </div>
-
-          <style>
-            {`
-              @keyframes cgim-indeterminate {
-                0% { transform: translateX(-120%); opacity: 0.6; }
-                50% { opacity: 1; }
-                100% { transform: translateX(320%); opacity: 0.6; }
-              }
-            `}
-          </style>
-        </div>
-      )}
+      {/* Loader sticky (extraído) */}
+      <CgimStickyLoader
+        show={showTopLoading}
+        title={topLoadingTitle}
+        progress={progress}
+        cardStyle={cardStyle}
+      />
 
       <div
         style={{
@@ -754,659 +748,106 @@ export default function CgimAnalyticsPage() {
         </div>
         <div style={{ fontSize: 12, opacity: 0.7, textAlign: "right" }}>
           {lastUpdated ? (
-            <>Atualizado em {lastUpdated.toLocaleString("pt-BR")}</>
+            <span>Atualizado em {lastUpdated.toLocaleString("pt-BR")}</span>
           ) : (
-            <>—</>
+            <span>—</span>
           )}
         </div>
       </div>
 
-      <div style={cardStyle}>
-        <div style={controlRow}>
-          <div>
-            <div style={labelStyle}>Entidade</div>
-            <select
-              value={entity}
-              onChange={(e) => {
-                setSelectedCategories([]);
-                setSelectedSubcategories([]);
-                setExpandedIds(new Set());
-                setTree([]);
-                setDictRowsAll([]);
-                setDiagnostics(null);
-                setError(null);
-                setLastUpdated(null);
-                setEntity(e.target.value);
-              }}
-              style={selectBoxStyle}
-            >
-              {entities.map((en) => (
-                <option key={en} value={en}>
-                  {en}
-                </option>
-              ))}
-            </select>
-          </div>
+      {/* Painel de controles (extraído) */}
+      {/* Painel de controles (extraído) */}
+<CgimControlsPanel
+  cardStyle={cardStyle}
+  labelStyle={labelStyle}
+  selectBoxStyle={selectBoxStyle}
+  multiSelectStyleBase={multiSelectStyleBase}
+  multiSelectSubcatStyle={multiSelectSubcatStyle}
 
-          <div>
-            <div style={labelStyle}>Ano</div>
-            <select
-              value={year}
-              onChange={(e) => setYear(Number(e.target.value))}
-              style={selectBoxStyle}
-            >
-              {years.map((y) => (
-                <option key={y} value={y}>
-                  {y}
-                </option>
-              ))}
-            </select>
-          </div>
+  entity={entity}
+  entities={entities}
+  onChangeEntity={(next) => {
+    setSelectedCategories([]);
+    setSelectedSubcategories([]);
+    setExpandedIds(new Set());
+    setTree([]);
+    setDictRowsAll([]);
+    setDiagnostics(null);
+    setError(null);
+    setLastUpdated(null);
+    setEntity(next);
+  }}
 
-          <div>
-            <div style={labelStyle}>Fluxo</div>
-            <select
-              value={flow}
-              onChange={(e) => setFlow(e.target.value as FlowType)}
-              style={selectBoxStyle}
-            >
-              <option value="import">Importação</option>
-              <option value="export">Exportação</option>
-            </select>
-          </div>
+  year={year}
+  years={years}
+  onChangeYear={(next) => setYear(next)}
 
-          <div>
-            <div style={labelStyle}>Visualização</div>
-            <select
-              value={viewMode}
-              onChange={(e) => setViewMode(e.target.value as ViewMode)}
-              style={selectBoxStyle}
-            >
-              <option value="BOTH">Tabela + Gráficos</option>
-              <option value="CHARTS">Somente Gráficos</option>
-              <option value="TABLE">Somente Tabela</option>
-            </select>
-          </div>
-        </div>
+  flow={flow}
+  onChangeFlow={(next) => setFlow(next)}
 
-        <div style={{ height: 12 }} />
+  viewMode={viewMode}
+  onChangeViewMode={(next) => setViewMode(next)}
 
-        <div style={controlRow}>
-          <div>
-            <div style={labelStyle}>Nível de desagregação</div>
-            <select
-              value={detailLevel}
-              onChange={(e) => setDetailLevel(e.target.value as DetailLevel)}
-              style={selectBoxStyle}
-            >
-              <option value="CATEGORY">Somente Categoria</option>
-              <option value="SUBCATEGORY">Categoria + Subcategoria</option>
-              <option value="NCM">Até NCM</option>
-            </select>
+  detailLevel={detailLevel as any}
+  onChangeDetailLevel={(next) => setDetailLevel(next as any)}
 
-            {detailLevel !== "CATEGORY" && (
-              <div style={{ marginTop: 10 }}>
-                <div style={labelStyle}>Profundidade da Subcategoria</div>
-                <select
-                  value={subcatDepth}
-                  onChange={(e) => {
-                    setSelectedSubcategories([]);
-                    setSubcatDepth(Number(e.target.value));
-                  }}
-                  style={selectBoxStyle}
-                >
-                  {Array.from(
-                    { length: Math.max(1, maxSubcatDepth) },
-                    (_, i) => i + 1
-                  ).map((d) => (
-                    <option key={d} value={d}>
-                      {d === 1 ? "Subcategoria (1)" : `Subcategoria (1…${d})`}
-                    </option>
-                  ))}
-                </select>
-                <div style={{ fontSize: 12, opacity: 0.65, marginTop: 6 }}>
-                  Máximo nesta entidade: {maxSubcatDepth}
-                </div>
-              </div>
-            )}
-          </div>
+  subcatDepth={subcatDepth}
+  maxSubcatDepth={maxSubcatDepth}
+  onChangeSubcatDepth={(next) => {
+    setSelectedSubcategories([]);
+    setSubcatDepth(next);
+  }}
 
-          <div>
-            <div style={labelStyle}>Total (cesta anual – ano selecionado)</div>
-            <div style={{ fontSize: 18, fontWeight: 900 }}>
-              FOB: {formatMoneyUS(total.fob)}
-            </div>
-            <div style={{ fontSize: 14, opacity: 0.85 }}>
-              KG: {formatKg(total.kg)}
-            </div>
-            <div style={{ fontSize: 14, opacity: 0.85 }}>
-              US$/t:{" "}
-              {formatUsdPerTon(total.kg > 0 ? total.fob / (total.kg / 1000) : 0)}
-            </div>
+  total={total}
+  formatFOB={formatMoneyUS}
+  formatKG={formatKg}
+  formatUsdPerTon={formatUsdPerTon}
 
-            {diagnostics && (
-              <div style={{ marginTop: 10, fontSize: 12, opacity: 0.9 }}>
-                <div style={{ fontWeight: 800, marginBottom: 6 }}>
-                  Diagnóstico
-                </div>
-                <div>
-                  Dicionário: {diagnostics.dictRows} linhas •{" "}
-                  {diagnostics.distinctNcms} NCMs únicos
-                </div>
-                <div>
-                  Duplicidades: {diagnostics.duplicateNcms} • Conflitos:{" "}
-                  {diagnostics.conflictingMappings}
-                </div>
-                <div>
-                  Comex rows: {diagnostics.comexRows} • Zeradas:{" "}
-                  {diagnostics.comexZeroRows}
-                </div>
-                {diagnostics.apiLikelyDown && (
-                  <div>⚠️ API parece ter retornado tudo zero.</div>
-                )}
-              </div>
-            )}
-          </div>
+  diagnostics={diagnostics as any}
 
-          <div style={{ gridColumn: "span 2" }}>
-            <div style={labelStyle}>Filtros (definem a cesta dos gráficos)</div>
-            <div style={filtersStack}>
-              <div>
-                <div style={labelStyle}>Filtrar Categorias (multi)</div>
-                <select
-                  multiple
-                  value={selectedCategories}
-                  onChange={(e) => {
-                    const values = Array.from(e.target.selectedOptions).map(
-                      (o) => o.value
-                    );
-                    setSelectedCategories(values);
-                    setSelectedSubcategories([]);
-                  }}
-                  style={multiSelectStyleBase}
-                >
-                  {availableCategories.map((c) => (
-                    <option key={c} value={c}>
-                      {c}
-                    </option>
-                  ))}
-                </select>
-                <div style={{ fontSize: 12, opacity: 0.65, marginTop: 6 }}>
-                  {selectedCategories.length
-                    ? `${selectedCategories.length} selecionada(s)`
-                    : "Todas"}
-                </div>
-              </div>
+  availableCategories={availableCategories}
+  availableSubcategories={availableSubcategories}
 
-              <div>
-                <div style={labelStyle}>Filtrar Subcategorias (multi)</div>
-                <select
-                  multiple
-                  value={selectedSubcategories}
-                  onChange={(e) => {
-                    const values = Array.from(e.target.selectedOptions).map(
-                      (o) => o.value
-                    );
-                    setSelectedSubcategories(values);
-                  }}
-                  style={multiSelectSubcatStyle}
-                >
-                  {availableSubcategories.map((s) => (
-                    <option key={s} value={s} title={s}>
-                      {truncateLabel(s, 140)}
-                    </option>
-                  ))}
-                </select>
-                <div style={{ fontSize: 12, opacity: 0.65, marginTop: 6 }}>
-                  {selectedSubcategories.length
-                    ? `${selectedSubcategories.length} selecionada(s)`
-                    : "Todas (quando existirem)"}
-                </div>
-              </div>
+  selectedCategories={selectedCategories}
+  selectedSubcategories={selectedSubcategories}
+  onChangeSelectedCategories={(next) => {
+    setSelectedCategories(next);
+    setSelectedSubcategories([]);
+  }}
+  onChangeSelectedSubcategories={(next) => setSelectedSubcategories(next)}
 
-              <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-                <button
-                  onClick={() => expandAll()}
-                  disabled={!tree.length}
-                  style={{
-                    padding: "10px 12px",
-                    borderRadius: 10,
-                    border: "1px solid #ddd",
-                    background: "#fff",
-                    cursor: "pointer",
-                  }}
-                >
-                  Expandir tudo
-                </button>
-                <button
-                  onClick={() => collapseAll()}
-                  disabled={!tree.length}
-                  style={{
-                    padding: "10px 12px",
-                    borderRadius: 10,
-                    border: "1px solid #ddd",
-                    background: "#fff",
-                    cursor: "pointer",
-                  }}
-                >
-                  Recolher tudo
-                </button>
-                <button
-                  onClick={() => resetFilters()}
-                  style={{
-                    padding: "10px 12px",
-                    borderRadius: 10,
-                    border: "1px solid #ddd",
-                    background: "#fff",
-                    cursor: "pointer",
-                  }}
-                >
-                  Limpar filtros
-                </button>
-              </div>
-            </div>
-          </div>
-        </div>
+  onExpandAll={() => expandAll()}
+  onCollapseAll={() => collapseAll()}
+  onResetFilters={() => resetFilters()}
 
-        {error && (
-          <div style={{ marginTop: 12, color: "#b00020", fontSize: 13 }}>
-            {error}
-          </div>
-        )}
-      </div>
+  error={error}
+  truncateLabel={truncateLabel}
+/>
+{/* Gráficos anuais + composição (extraído) */}
+      <CgimAnnualChartsPanel
+        cardStyle={cardStyle}
+        sourceFooterStyle={sourceFooterStyle}
+        basketLabel={basketLabel}
+        chartsLoading={chartsLoading}
+        chartsError={chartsError}
+        annualImportSeries={annualImportSeries}
+        annualExportSeries={annualExportSeries}
+        annualPriceIeSeries={annualPriceIeSeries}
+        annualBalanceSeriesSigned={annualBalanceSeriesSigned}
+        balanceMaxAbs={balanceMaxAbs}
+        tickKg={tickKg}
+        tickFob={tickFob}
+        tickPrice={tickPrice}
+        categoryBars={categoryBars}
+        subcatBars={subcatBars}
+        categoryBarsKg={categoryBarsKg}
+        subcatBarsKg={subcatBarsKg}
+        compositionCategoryTextFob={compositionCategoryTextFob}
+        compositionSubcategoryTextFob={compositionSubcategoryTextFob}
+        compositionCategoryTextKg={compositionCategoryTextKg}
+        compositionSubcategoryTextKg={compositionSubcategoryTextKg}
+      />
 
-      {(viewMode === "CHARTS" || viewMode === "BOTH") && (
-        <div style={cardStyle}>
-          <div
-            style={{
-              display: "flex",
-              justifyContent: "space-between",
-              alignItems: "baseline",
-              marginBottom: 10,
-            }}
-          >
-            <div style={{ fontWeight: 900 }}>
-              Gráficos Anuais (Comex Stat)
-            </div>
-            <div style={{ fontSize: 12, opacity: 0.7 }}>
-              {chartsLoading ? "Carregando…" : "OK"}
-            </div>
-          </div>
-
-          {chartsError && (
-            <div style={{ marginBottom: 10, color: "#b00020", fontSize: 13 }}>
-              {chartsError}
-            </div>
-          )}
-
-          {!chartsLoading && !annualSeries.length && (
-            <div style={{ fontSize: 13, opacity: 0.75 }}>
-              Sem dados para gráficos (cesta vazia).
-            </div>
-          )}
-
-          {!!annualImportSeries.length && (
-            <>
-              <div style={{ fontSize: 12, opacity: 0.75, marginBottom: 10 }}>
-                Cesta exibida: <strong>{basketLabel}</strong>
-              </div>
-
-              {/* ✅ 2×2 (desktop) / 1 por linha (mobile): exatamente como o padrão do módulo NCM */}
-              <div className="cgimAnnualGrid2">
-                <div
-                  style={{
-                    border: "1px solid #e6e6e6",
-                    borderRadius: 12,
-                    background: "#fff",
-                    boxShadow: "0 10px 22px rgba(0,0,0,0.12)",
-                    overflow: "hidden",
-                  }}
-                >
-                  <div style={{ padding: "14px 14px 0 14px" }}>
-                    <div
-                      style={{
-                        fontWeight: 900,
-                        fontSize: 18,
-                        textAlign: "center",
-                        marginBottom: 8,
-                      }}
-                    >
-                      Importações (KG) — {basketLabel}
-                    </div>
-
-                    <div style={{ padding: "0 6px 12px 6px" }}>
-                      <ResponsiveContainer width="100%" height={320}>
-                        <BarChart data={annualImportSeries} barSize={42} barCategoryGap="10%" barGap={2} margin={{ top: 10, right: 20, left: 54, bottom: 10 }}>
-                          <CartesianGrid strokeDasharray="3 3" />
-                          <XAxis dataKey="name" />
-                          <YAxis tickFormatter={tickKg} domain={[0, (dataMax: number) => Math.max(0, dataMax) * 1.1]} />
-                          <Tooltip
-                            formatter={(value: any) => tickKg(value)}
-                            labelFormatter={(label) => `Ano: ${label}`}
-                          />
-                          <Legend />
-                          <Bar
-                            dataKey="kg"
-                            name="Importações (KG)"
-                            fill="#f59e0b"
-                            radius={[6, 6, 0, 0]}
-                          />
-                        </BarChart>
-                      </ResponsiveContainer>
-                    </div>
-                  </div>
-                  <div style={sourceFooterStyle}>
-                    Fonte: Comex Stat/MDIC. Elaboração própria.
-                  </div>
-                </div>
-
-                <div
-                  style={{
-                    border: "1px solid #e6e6e6",
-                    borderRadius: 12,
-                    background: "#fff",
-                    boxShadow: "0 10px 22px rgba(0,0,0,0.12)",
-                    overflow: "hidden",
-                  }}
-                >
-                  <div style={{ padding: "14px 14px 0 14px" }}>
-                    <div
-                      style={{
-                        fontWeight: 900,
-                        fontSize: 18,
-                        textAlign: "center",
-                        marginBottom: 8,
-                      }}
-                    >
-                      Importações (US$ FOB) — {basketLabel}
-                    </div>
-
-                    <div style={{ padding: "0 6px 12px 6px" }}>
-                      <ResponsiveContainer width="100%" height={320}>
-                        <BarChart data={annualImportSeries} barSize={42} barCategoryGap="10%" barGap={2} margin={{ top: 10, right: 20, left: 54, bottom: 10 }}>
-                          <CartesianGrid strokeDasharray="3 3" />
-                          <XAxis dataKey="name" />
-                          <YAxis tickFormatter={tickFob} domain={[0, (dataMax: number) => Math.max(0, dataMax) * 1.1]} />
-                          <Tooltip
-                            formatter={(value: any) => tickFob(value)}
-                            labelFormatter={(label) => `Ano: ${label}`}
-                          />
-                          <Legend />
-                          <Bar
-                            dataKey="fob"
-                            name="Importações (US$ FOB)"
-                            fill="#f59e0b"
-                            radius={[6, 6, 0, 0]}
-                          />
-                        </BarChart>
-                      </ResponsiveContainer>
-                    </div>
-                  </div>
-                  <div style={sourceFooterStyle}>
-                    Fonte: Comex Stat/MDIC. Elaboração própria.
-                  </div>
-                </div>
-
-                <div
-                  style={{
-                    border: "1px solid #e6e6e6",
-                    borderRadius: 12,
-                    background: "#fff",
-                    boxShadow: "0 10px 22px rgba(0,0,0,0.12)",
-                    overflow: "hidden",
-                  }}
-                >
-                  <div style={{ padding: "14px 14px 0 14px" }}>
-                    <div
-                      style={{
-                        fontWeight: 900,
-                        fontSize: 18,
-                        textAlign: "center",
-                        marginBottom: 8,
-                      }}
-                    >
-                      Exportações (KG) — {basketLabel}
-                    </div>
-
-                    <div style={{ padding: "0 6px 12px 6px" }}>
-                      <ResponsiveContainer width="100%" height={320}>
-                        <BarChart data={annualExportSeries} barSize={42} barCategoryGap="10%" barGap={2} margin={{ top: 10, right: 20, left: 54, bottom: 10 }}>
-                          <CartesianGrid strokeDasharray="3 3" />
-                          <XAxis dataKey="name" />
-                          <YAxis tickFormatter={tickKg} domain={[0, (dataMax: number) => Math.max(0, dataMax) * 1.1]} />
-                          <Tooltip
-                            formatter={(value: any) => tickKg(value)}
-                            labelFormatter={(label) => `Ano: ${label}`}
-                          />
-                          <Legend />
-                          <Bar
-                            dataKey="kg"
-                            name="Exportações (KG)"
-                            fill="#3b82f6"
-                            radius={[6, 6, 0, 0]}
-                          />
-                        </BarChart>
-                      </ResponsiveContainer>
-                    </div>
-                  </div>
-                  <div style={sourceFooterStyle}>
-                    Fonte: Comex Stat/MDIC. Elaboração própria.
-                  </div>
-                </div>
-
-                <div
-                  style={{
-                    border: "1px solid #e6e6e6",
-                    borderRadius: 12,
-                    background: "#fff",
-                    boxShadow: "0 10px 22px rgba(0,0,0,0.12)",
-                    overflow: "hidden",
-                  }}
-                >
-                  <div style={{ padding: "14px 14px 0 14px" }}>
-                    <div
-                      style={{
-                        fontWeight: 900,
-                        fontSize: 18,
-                        textAlign: "center",
-                        marginBottom: 8,
-                      }}
-                    >
-                      Exportações (US$ FOB) — {basketLabel}
-                    </div>
-
-                    <div style={{ padding: "0 6px 12px 6px" }}>
-                      <ResponsiveContainer width="100%" height={320}>
-                        <BarChart data={annualExportSeries} barSize={42} barCategoryGap="10%" barGap={2} margin={{ top: 10, right: 20, left: 54, bottom: 10 }}>
-                          <CartesianGrid strokeDasharray="3 3" />
-                          <XAxis dataKey="name" />
-                          <YAxis tickFormatter={tickFob} domain={[0, (dataMax: number) => Math.max(0, dataMax) * 1.1]} />
-                          <Tooltip
-                            formatter={(value: any) => tickFob(value)}
-                            labelFormatter={(label) => `Ano: ${label}`}
-                          />
-                          <Legend />
-                          <Bar
-                            dataKey="fob"
-                            name="Exportações (US$ FOB)"
-                            fill="#3b82f6"
-                            radius={[6, 6, 0, 0]}
-                          />
-                        </BarChart>
-                      </ResponsiveContainer>
-                    </div>
-                  </div>
-                  <div style={sourceFooterStyle}>
-                    Fonte: Comex Stat/MDIC. Elaboração própria.
-                  </div>
-                </div>
-              </div>
-
-              <div style={{ height: 12 }} />
-
-              {/* ✅ Preço médio (Import vs Export) + Balança (Import + Export + linha) */}
-              <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
-                <div
-                  style={{
-                    border: "1px solid #e6e6e6",
-                    borderRadius: 12,
-                    background: "#fff",
-                    boxShadow: "0 10px 22px rgba(0,0,0,0.12)",
-                    overflow: "hidden",
-                  }}
-                >
-                  <div style={{ padding: "14px 14px 0 14px" }}>
-                    <div
-                      style={{
-                        fontWeight: 900,
-                        fontSize: 18,
-                        textAlign: "center",
-                        marginBottom: 8,
-                      }}
-                    >
-                      Preços Médios (US$/t) — Importação vs Exportação — {basketLabel}
-                    </div>
-
-                    <div style={{ padding: "0 6px 12px 6px" }}>
-                      <ResponsiveContainer width="100%" height={320}>
-                        <LineChart data={annualPriceIeSeries} margin={{ top: 10, right: 20, left: 54, bottom: 10 }}>
-                          <CartesianGrid strokeDasharray="3 3" />
-                          <XAxis dataKey="name" />
-                          <YAxis
-                            tickFormatter={tickPrice}
-                          />
-                          <Tooltip
-                            formatter={(value: any) => tickPrice(value)}
-                            labelFormatter={(label) => `Ano: ${label}`}
-                          />
-                          <Legend />
-                          <Line
-                            type="monotone"
-                            dataKey="importPrice"
-                            name="Preço Médio Importação (US$/t)"
-                            stroke="#ef4444"
-                            strokeWidth={2}
-                            dot={{ r: 4 }}
-                          />
-                          <Line
-                            type="monotone"
-                            dataKey="exportPrice"
-                            name="Preço Médio Exportação (US$/t)"
-                            stroke="#3b82f6"
-                            strokeWidth={2}
-                            dot={{ r: 4 }}
-                          />
-                        </LineChart>
-                      </ResponsiveContainer>
-                    </div>
-                  </div>
-                  <div style={sourceFooterStyle}>
-                    Fonte: Comex Stat/MDIC. Elaboração própria.
-                  </div>
-                </div>
-
-                <div
-                  style={{
-                    border: "1px solid #e6e6e6",
-                    borderRadius: 12,
-                    background: "#fff",
-                    boxShadow: "0 10px 22px rgba(0,0,0,0.12)",
-                    overflow: "hidden",
-                  }}
-                >
-                  <div style={{ padding: "14px 14px 0 14px" }}>
-                    <div
-                      style={{
-                        fontWeight: 900,
-                        fontSize: 18,
-                        textAlign: "center",
-                        marginBottom: 8,
-                      }}
-                    >
-                      Exportação, Importação e Balança Comercial (US$ FOB) — {basketLabel}
-                    </div>
-
-                    <div style={{ padding: "0 6px 12px 6px" }}>
-                      <ResponsiveContainer width="100%" height={320}>
-                        <ComposedChart
-                          data={annualBalanceSeriesSigned}
-                          margin={{ top: 10, right: 20, left: 54, bottom: 10 }}
-                          barSize={24}
-                          barCategoryGap="26%"
-                          barGap={2}
-                        >
-                          <CartesianGrid strokeDasharray="3 3" />
-                          <XAxis dataKey="name" />
-                          <YAxis tickFormatter={tickFob} domain={[-balanceMaxAbs, balanceMaxAbs]} />
-                          <Tooltip
-                            formatter={(value: any) => tickFob(value)}
-                            labelFormatter={(label) => `Ano: ${label}`}
-                          />
-                          <Legend />
-                          <ReferenceLine y={0} stroke="#111" strokeWidth={2} />
-                          <Bar
-                            dataKey="exportFobPos"
-                            name="Exportação"
-                            fill="#3b82f6"
-                            radius={[6, 6, 0, 0]}
-                          />
-                          <Bar
-                            dataKey="importFobNeg"
-                            name="Importação"
-                            fill="#ef4444"
-                            radius={[0, 0, 6, 6]}
-                          />
-                          <Line
-                            type="monotone"
-                            dataKey="balanceFob"
-                            name="Balança Comercial"
-                            stroke="#10b981"
-                            strokeWidth={3}
-                            dot={{ r: 5, fill: "#fff", stroke: "#10b981", strokeWidth: 2 }}
-                            activeDot={{
-                              r: 6,
-                              fill: "#fff",
-                              stroke: "#10b981",
-                              strokeWidth: 2,
-                            }}
-                          />
-                        </ComposedChart>
-                      </ResponsiveContainer>
-                    </div>
-                  </div>
-                  <div style={sourceFooterStyle}>
-                    Fonte: Comex Stat/MDIC. Elaboração própria.
-                  </div>
-                </div>
-              </div>
-
-              <div style={{ height: 12 }} />
-
-              {/* Mantém os gráficos de composição por categoria/subcategoria */}
-              <div className="cgimAnnualGrid2">
-                <SimpleBarChart
-                  title="Composição por Categoria (FOB) — Top 20"
-                  data={categoryBars}
-                  xAxisKey="name"
-                  dataKey="fob"
-                  yAxisLabel="FOB (US$)"
-                  barName="FOB"
-                  showLegend={false}
-                />
-
-                <SimpleBarChart
-                  title="Composição por Subcategoria (FOB) — Top 25"
-                  data={subcatBars}
-                  xAxisKey="name"
-                  dataKey="fob"
-                  yAxisLabel="FOB (US$)"
-                  barName="FOB"
-                  showLegend={false}
-                />
-              </div>
-            </>
-          )}        </div>
-      )}
 
       {(viewMode === "TABLE" || viewMode === "BOTH") && (
         <div style={cardStyle}>
