@@ -4,7 +4,6 @@ import Section from "./Section";
 import CgimStickyLoader from "./cgim/CgimStickyLoader";
 import CgimControlsPanel from "./cgim/CgimControlsPanel";
 import CgimAnnualChartsPanel from "./cgim/CgimAnnualChartsPanel";
-import { CgimHierarchyTable } from "./CgimHierarchyTable";
 import SimpleLineChart from "./charts/SimpleLineChart";
 import CompositionDonutChart from "./charts/CompositionDonutChart";
 import {
@@ -50,7 +49,7 @@ function formatMoneyUS(v: number): string {
 function formatKg(v: number): string {
   return new Intl.NumberFormat("pt-BR", { maximumFractionDigits: 0 }).format(v);
 }
-function formatUsdPerTon(v: number): string {
+function formatUsdPerTonTable(v: number): string {
   return new Intl.NumberFormat("pt-BR", { maximumFractionDigits: 0 }).format(v);
 }
 
@@ -120,6 +119,417 @@ function collectNcmsFromDictionary(args: {
   return Array.from(out);
 }
 
+
+/* ======================================================================================
+   CGIM — TABELA HIERÁRQUICA (INLINE)
+   Escopo: apenas EXIBIÇÃO da tabela (sem mexer em API/services/cálculos).
+   Mantém: hierarquia, colunas fixas à esquerda, rolagem horizontal, cores saldo +/-
+   Adiciona colunas: EXP (FOB/KG), IMP (FOB/KG), BALANÇA (FOB/KG), PM IMP/EXP (US$/t)
+====================================================================================== */
+
+type TableSortKey = "fob" | "kg";
+type TableSortDir = "asc" | "desc";
+
+type CgimHierarchyTableProps = {
+  tree: any[]; // HierarchyNode[] (mantido como any para evitar refatorações / dependências circulares)
+  detailLevel: any; // DetailLevel
+  selectedCategories: string[];
+  selectedSubcategories: string[];
+  expandedIds: Set<string>;
+  onToggleExpand: (id: string) => void;
+  sortKey: TableSortKey;
+  sortDir: TableSortDir;
+  onChangeSort: (k: TableSortKey) => void;
+  formatFOB: (v: number) => string;
+  formatKG: (v: number) => string;
+  formatUsdPerTon?: (v: number) => string;
+};
+
+function pickNumber(obj: any, keys: string[]): number | undefined {
+  if (!obj) return undefined;
+  for (const k of keys) {
+    const v = obj?.[k];
+    if (typeof v === "number" && !Number.isNaN(v)) return v;
+  }
+  return undefined;
+}
+
+
+function balanceStyle(v?: number): React.CSSProperties {
+  if (v === null || v === undefined || Number.isNaN(v)) return {};
+  if (v > 0) return { color: "#0E7A2F", fontWeight: 700 };
+  if (v < 0) return { color: "#B42318", fontWeight: 700 };
+  return { color: "#111827", fontWeight: 700 };
+}
+
+function nodeId(n: any): string {
+  return String(n?.id ?? n?.key ?? n?.code ?? n?.ncm ?? n?.name ?? Math.random());
+}
+
+function nodeLabel(n: any): string {
+  return String(n?.label ?? n?.name ?? n?.title ?? n?.ncm ?? "—");
+}
+
+function nodeSecondary(n: any): string | undefined {
+  const d = n?.description ?? n?.desc ?? n?.secondary;
+  return typeof d === "string" ? d : undefined;
+}
+
+function nodeChildren(n: any): any[] {
+  return (n?.children ?? n?.subcategories ?? n?.items ?? []) as any[];
+}
+
+function metric(obj: any) {
+  // IMPORTANT: NÃO CALCULA dados-base; apenas lê campos já existentes.
+  // Para tabela analítica (merge), preferimos: obj.imp / obj.exp (cada um com {fob, kg})
+  const impObj = obj?.imp ?? obj?.import ?? null;
+  const expObj = obj?.exp ?? obj?.export ?? null;
+
+  const impFob = pickNumber(impObj, ["fob", "impFob", "importFob", "metricFOB", "fobImp"]) ?? pickNumber(obj?.metrics ?? obj, ["fob", "impFob", "importFob"]);
+  const impKg  = pickNumber(impObj, ["kg", "impKg", "importKg", "metricKG", "kgImp"]) ?? pickNumber(obj?.metrics ?? obj, ["kg", "impKg", "importKg"]);
+
+  const expFob = pickNumber(expObj, ["fob", "expFob", "exportFob", "metricFOB", "fobExp"]);
+  const expKg  = pickNumber(expObj, ["kg", "expKg", "exportKg", "metricKG", "kgExp"]);
+
+  // Saldo: se existir pronto, usa; senão deriva (somente exibição)
+  const balFob = pickNumber(obj, ["balanceFob", "balFob", "saldoFob", "balance_fob", "saldo_fob"]) ?? (
+    (typeof expFob === "number" && typeof impFob === "number") ? (expFob - impFob) : undefined
+  );
+  const balKg  = pickNumber(obj, ["balanceKg", "balKg", "saldoKg", "balance_kg", "saldo_kg"]) ?? (
+    (typeof expKg === "number" && typeof impKg === "number") ? (expKg - impKg) : undefined
+  );
+
+  // Preço médio (US$/t): se existir pronto, usa; senão deriva (somente exibição)
+  const pmImp = pickNumber(obj, ["avgImpUsdPerTon", "pmImpUsdPerTon", "avgImportUsdPerTon", "pmImportUsdPerTon"]);
+  const pmExp = pickNumber(obj, ["avgExpUsdPerTon", "pmExpUsdPerTon", "avgExportUsdPerTon", "pmExportUsdPerTon"]);
+
+  const pmImpDerived =
+    pmImp !== undefined ? pmImp :
+    (typeof impFob === "number" && typeof impKg === "number" && impKg > 0 ? (impFob * 1000) / impKg : undefined);
+
+  const pmExpDerived =
+    pmExp !== undefined ? pmExp :
+    (typeof expFob === "number" && typeof expKg === "number" && expKg > 0 ? (expFob * 1000) / expKg : undefined);
+
+  return { expFob, expKg, impFob, impKg, balFob, balKg, pmImp: pmImpDerived, pmExp: pmExpDerived };
+}
+
+function CgimHierarchyTable(props: CgimHierarchyTableProps) {
+  const {
+    tree,
+    expandedIds,
+    onToggleExpand,
+    sortKey,
+    sortDir,
+    onChangeSort,
+    formatFOB,
+    formatKG,
+    formatUsdPerTon,
+  } = props;
+
+  const styles: Record<string, React.CSSProperties> = {
+    wrap: {
+      border: "1px solid #E6E8EC",
+      borderRadius: 14,
+      background: "#fff",
+      overflow: "hidden",
+    },
+    tableWrap: { overflowX: "auto" },
+    table: {
+      width: "100%",
+      borderCollapse: "separate",
+      borderSpacing: 0,
+      minWidth: 1250,
+      fontSize: 13,
+    },
+    theadTh: {
+      position: "sticky",
+      top: 0,
+      zIndex: 4,
+      background: "#F9FAFB",
+      borderBottom: "1px solid #E6E8EC",
+      padding: "10px 10px",
+      textAlign: "right",
+      fontWeight: 800,
+      whiteSpace: "nowrap",
+    },
+    theadThLeft: {
+      position: "sticky",
+      top: 0,
+      left: 0,
+      zIndex: 6,
+      background: "#F9FAFB",
+      borderBottom: "1px solid #E6E8EC",
+      padding: "10px 10px",
+      textAlign: "left",
+      fontWeight: 800,
+      whiteSpace: "nowrap",
+    },
+    groupHead: {
+      background: "#F9FAFB",
+      borderBottom: "1px solid #E6E8EC",
+      padding: "8px 10px",
+      textAlign: "center",
+      fontWeight: 900,
+      whiteSpace: "nowrap",
+    },
+    groupHeadLeft: {
+      position: "sticky",
+      left: 0,
+      zIndex: 6,
+      background: "#F9FAFB",
+      borderBottom: "1px solid #E6E8EC",
+      padding: "8px 10px",
+      textAlign: "left",
+      fontWeight: 900,
+      whiteSpace: "nowrap",
+    },
+    td: {
+      borderBottom: "1px solid #F1F2F4",
+      padding: "10px 10px",
+      textAlign: "right",
+      whiteSpace: "nowrap",
+      color: "#111827",
+    },
+    tdLeft: {
+      position: "sticky",
+      left: 0,
+      zIndex: 3,
+      background: "#fff",
+      borderBottom: "1px solid #F1F2F4",
+      padding: "10px 10px",
+      textAlign: "left",
+      whiteSpace: "nowrap",
+    },
+    btn: {
+      border: "1px solid #E6E8EC",
+      background: "#fff",
+      borderRadius: 10,
+      width: 24,
+      height: 24,
+      cursor: "pointer",
+      display: "inline-flex",
+      alignItems: "center",
+      justifyContent: "center",
+      marginRight: 8,
+      userSelect: "none",
+    },
+    sub: { color: "#6B7280", fontSize: 12, marginTop: 2, maxWidth: 520, overflow: "hidden", textOverflow: "ellipsis" },
+    rowCat: { fontWeight: 800 },
+    rowSub: { fontWeight: 700 },
+    rowNcm: { fontWeight: 500 },
+    sortBtn: {
+      border: "none",
+      background: "transparent",
+      cursor: "pointer",
+      padding: 0,
+      fontWeight: 800,
+      color: "#111827",
+    },
+  };
+
+  function chevron(open: boolean) {
+    return open ? "▾" : "▸";
+  }
+
+  function indent(depth: number): React.CSSProperties {
+    return { paddingLeft: 10 + depth * 18 };
+  }
+
+  function flatten(nodes: any[], depth: number, kind: "category" | "subcategory" | "ncm", acc: any[]) {
+    // Ordenação: mantém lógica original de sortKey/sortDir (aplicada no nível atual)
+    const sorted = [...nodes].sort((a, b) => {
+      const ma = metric(a);
+      const mb = metric(b);
+      const va = sortKey === "fob" ? (ma.impFob ?? 0) : (ma.impKg ?? 0);
+      const vb = sortKey === "fob" ? (mb.impFob ?? 0) : (mb.impKg ?? 0);
+      const diff = va - vb;
+      return sortDir === "asc" ? diff : -diff;
+    });
+
+    for (const n of sorted) {
+      const id = nodeId(n);
+      const kids = nodeChildren(n);
+      const open = expandedIds.has(id);
+
+      acc.push({ n, id, depth, kind, hasChildren: kids.length > 0, open });
+
+      if (kids.length > 0 && open) {
+        const nextKind = kind === "category" ? "subcategory" : kind === "subcategory" ? "ncm" : "ncm";
+        flatten(kids, depth + 1, nextKind, acc);
+      }
+    }
+  }
+
+  const rows = React.useMemo(() => {
+    const acc: any[] = [];
+    flatten(tree ?? [], 0, "category", acc);
+    return acc;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tree, expandedIds, sortKey, sortDir]);
+
+  const sortLabel = sortKey === "fob" ? "FOB" : "KG";
+
+  return (
+    <div style={styles.wrap}>
+      <div style={{ padding: "10px 12px", borderBottom: "1px solid #E6E8EC", display: "flex", gap: 14, alignItems: "center" }}>
+        <div style={{ fontWeight: 900, color: "#111827" }}>Tabela</div>
+        <div style={{ fontSize: 12, color: "#6B7280" }}>
+          Ordenação:{" "}
+          <button style={styles.sortBtn} onClick={() => onChangeSort(sortKey)} title="Alternar direção">
+            {sortLabel} ({sortDir})
+          </button>
+          {" · "}
+          <button style={styles.sortBtn} onClick={() => onChangeSort(sortKey === "fob" ? "kg" : "fob")} title="Trocar chave de ordenação">
+            trocar para {sortKey === "fob" ? "KG" : "FOB"}
+          </button>
+        </div>
+      </div>
+
+      <div style={styles.tableWrap}>
+        <table style={styles.table}>
+          <thead>
+            <tr>
+              <th style={styles.groupHeadLeft}>Hierarquia</th>
+              <th style={styles.groupHead} colSpan={2}>EXP</th>
+              <th style={styles.groupHead} colSpan={2}>IMP</th>
+              <th style={styles.groupHead} colSpan={2}>BALANÇA</th>
+              <th style={styles.groupHead} colSpan={2}>PREÇO MÉDIO (US$/t)</th>
+            </tr>
+            <tr>
+              <th style={styles.theadThLeft}>Categoria / Subcategoria / NCM</th>
+
+              <th style={styles.theadTh} title="Exportação (US$ FOB)">EXP (US$ FOB)</th>
+              <th style={styles.theadTh} title="Exportação (KG)">EXP (KG)</th>
+
+              <th style={styles.theadTh} title="Importação (US$ FOB)">IMP (US$ FOB)</th>
+              <th style={styles.theadTh} title="Importação (KG)">IMP (KG)</th>
+
+              <th style={styles.theadTh} title="Saldo comercial (US$ FOB)">BALANÇA (FOB)</th>
+              <th style={styles.theadTh} title="Saldo comercial (KG)">BALANÇA (KG)</th>
+
+              <th style={styles.theadTh} title="Preço médio de importação (US$/t)">PM IMP (US$/t)</th>
+              <th style={styles.theadTh} title="Preço médio de exportação (US$/t)">PM EXP (US$/t)</th>
+            </tr>
+          </thead>
+
+          <tbody>
+            {rows.length === 0 ? (
+              <tr>
+                <td colSpan={9} style={{ padding: 16, color: "#6B7280" }}>Nenhum dado para exibir.</td>
+              </tr>
+            ) : (
+              rows.map((r) => {
+                const m = metric(r.n);
+
+                const label = nodeLabel(r.n);
+                const secondary = nodeSecondary(r.n);
+
+                const trStyle =
+                  r.kind === "category" ? styles.rowCat : r.kind === "subcategory" ? styles.rowSub : styles.rowNcm;
+
+                return (
+                  <tr key={r.id} style={trStyle}>
+                    <td style={{ ...styles.tdLeft, ...indent(r.depth) }}>
+                      <div style={{ display: "flex", alignItems: "flex-start", gap: 8 }}>
+                        {r.hasChildren ? (
+                          <button
+                            type="button"
+                            style={styles.btn}
+                            onClick={() => onToggleExpand(r.id)}
+                            aria-label={r.open ? "Recolher" : "Expandir"}
+                            title={r.open ? "Recolher" : "Expandir"}
+                          >
+                            {chevron(r.open)}
+                          </button>
+                        ) : (
+                          <span style={{ width: 24, display: "inline-block" }} />
+                        )}
+
+                        <div style={{ display: "flex", flexDirection: "column" }}>
+                          <span style={{ color: "#111827" }}>{label}</span>
+                          {secondary ? <span style={styles.sub} title={secondary}>{secondary}</span> : null}
+                        </div>
+                      </div>
+                    </td>
+
+                    {/* EXP */}
+                    <td style={styles.td}>{m.expFob === undefined ? "—" : formatFOB(m.expFob)}</td>
+                    <td style={styles.td}>{m.expKg === undefined ? "—" : formatKG(m.expKg)}</td>
+
+                    {/* IMP */}
+                    <td style={styles.td}>{m.impFob === undefined ? "—" : formatFOB(m.impFob)}</td>
+                    <td style={styles.td}>{m.impKg === undefined ? "—" : formatKG(m.impKg)}</td>
+
+                    {/* BALANÇA */}
+                    <td style={{ ...styles.td, ...balanceStyle(m.balFob) }}>{m.balFob === undefined ? "—" : formatFOB(m.balFob)}</td>
+                    <td style={{ ...styles.td, ...balanceStyle(m.balKg) }}>{m.balKg === undefined ? "—" : formatKG(m.balKg)}</td>
+
+                    {/* PREÇO MÉDIO */}
+                    <td style={styles.td}>{m.pmImp === undefined ? "—" : formatUsdPerTonTable(m.pmImp)}</td>
+                    <td style={styles.td}>{m.pmExp === undefined ? "—" : formatUsdPerTonTable(m.pmExp)}</td>
+                  </tr>
+                );
+              })
+            )}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+
+/* ======================================================================================
+   CGIM — MERGE DE ÁRVORES (IMPORT + EXPORT) PARA TABELA
+   - Não altera services. Apenas combina duas árvores já agregadas.
+   - A tabela passa a ler: node.imp.{fob,kg} e node.exp.{fob,kg}
+====================================================================================== */
+function indexTreeById(nodes: any[], map = new Map<string, any>()) {
+  for (const n of nodes || []) {
+    const id = String(n?.id ?? n?.key ?? n?.code ?? n?.ncm ?? n?.name);
+    map.set(id, n);
+    const kids = (n?.children ?? n?.subcategories ?? n?.items ?? []) as any[];
+    if (kids?.length) indexTreeById(kids, map);
+  }
+  return map;
+}
+
+function cloneNodeShallow(n: any) {
+  // clone raso preservando tudo (evita regressões de UI)
+  return { ...n };
+}
+
+function mergeImpExpTrees(importTree: any[], exportTree: any[]) {
+  const expIndex = indexTreeById(exportTree || []);
+  const mergeNode = (nImp: any): any => {
+    const id = String(nImp?.id ?? nImp?.key ?? nImp?.code ?? nImp?.ncm ?? nImp?.name);
+    const nExp = expIndex.get(id);
+
+    const out = cloneNodeShallow(nImp);
+
+    // Preserva metrics originais (usadas em outros lugares). Adiciona canais "imp" e "exp" para tabela.
+    out.imp = {
+      fob: nImp?.metrics?.fob ?? nImp?.fob ?? 0,
+      kg: nImp?.metrics?.kg ?? nImp?.kg ?? 0,
+    };
+
+    out.exp = {
+      fob: nExp?.metrics?.fob ?? nExp?.fob ?? 0,
+      kg: nExp?.metrics?.kg ?? nExp?.kg ?? 0,
+    };
+
+    const kidsImp = (nImp?.children ?? nImp?.subcategories ?? nImp?.items ?? []) as any[];
+    if (kidsImp?.length) {
+      out.children = kidsImp.map(mergeNode);
+    }
+
+    return out;
+  };
+
+  return (importTree || []).map(mergeNode);
+}
+
 export default function CgimAnalyticsPage() {
   const [entity, setEntity] = React.useState<string>("IABR");
   const [year, setYear] = React.useState<number>(2024);
@@ -149,6 +559,7 @@ export default function CgimAnalyticsPage() {
   const [error, setError] = React.useState<string | null>(null);
 
   const [tree, setTree] = React.useState<HierarchyNode[]>([]);
+  const [tableTree, setTableTree] = React.useState<any[]>([]);
   const [lastUpdated, setLastUpdated] = React.useState<Date | null>(null);
 
   const [entities, setEntities] = React.useState<string[]>([
@@ -229,6 +640,7 @@ export default function CgimAnalyticsPage() {
 
     async function run() {
       setTree([]);
+    setTableTree([]);
       setExpandedIds(new Set());
       setDiagnostics(null);
       setError(null);
@@ -313,25 +725,47 @@ export default function CgimAnalyticsPage() {
           )
         ) as string[];
 
-        const basketRows: CgimAnnualBasketRow[] = await fetchAnnualBasketByNcm({
-          entity,
-          year: String(year),
-          flow,
-          ncms: ncmsAllUnique,
-          chunkSize: 60,
-          concurrency: 2,
-          onProgress: (info) => {
-            if (!cancelled) setProgress(info);
-          },
-        });
+        const [basketImportRows, basketExportRows]: [CgimAnnualBasketRow[], CgimAnnualBasketRow[]] =
+          await Promise.all([
+            fetchAnnualBasketByNcm({
+              year: String(year),
+              flow: "import",
+              ncms: ncmsAllUnique,
+              chunkSize: 60,
+              concurrency: 2,
+              onProgress: (info) => {
+                if (!cancelled) setProgress(info);
+              },
+            }),
+            fetchAnnualBasketByNcm({
+              year: String(year),
+              flow: "export",
+              ncms: ncmsAllUnique,
+              chunkSize: 60,
+              concurrency: 2,
+              // não precisa progredir 2x; mantém o mesmo callback
+              onProgress: (info) => {
+                if (!cancelled) setProgress(info);
+              },
+            }),
+          ]);
 
         if (cancelled) return;
 
-        const comexRows = basketRows.map((r) => ({
+        const comexRowsImport = basketImportRows.map((r) => ({
           ncm: r.ncm,
           metricFOB: r.fob,
           metricKG: r.kg,
         }));
+
+        const comexRowsExport = basketExportRows.map((r) => ({
+          ncm: r.ncm,
+          metricFOB: r.fob,
+          metricKG: r.kg,
+        }));
+
+        // Mantém compatibilidade: comexRows "principal" segue o flow selecionado (para não quebrar o resto)
+        const comexRows = (flow === "export" ? comexRowsExport : comexRowsImport);
 
         const comexZeroRows = comexRows.filter(
           (r) =>
@@ -353,17 +787,31 @@ export default function CgimAnalyticsPage() {
         });
 
         // ✅ FIX: seedGroupsFromDictionary + seedRows
-        const nextTree = buildHierarchyTree({
+        const importTree = buildHierarchyTree({
           dictRows: dictRowsDedup,
           seedRows: dictRowsRawAll,
-          comexRows,
+          comexRows: comexRowsImport,
           includeUnmapped: true,
           includeAllZero: apiLikelyDown,
           seedGroupsFromDictionary: true,
           includeZeroLeaves: false,
         });
 
-        setTree(nextTree);
+        const exportTree = buildHierarchyTree({
+          dictRows: dictRowsDedup,
+          seedRows: dictRowsRawAll,
+          comexRows: comexRowsExport,
+          includeUnmapped: true,
+          includeAllZero: apiLikelyDown,
+          seedGroupsFromDictionary: true,
+          includeZeroLeaves: false,
+        });
+
+        // árvore principal (mantém comportamento atual do módulo)
+        setTree(flow === "export" ? exportTree : importTree);
+
+        // árvore combinada para tabela analítica (IMP + EXP)
+        setTableTree(mergeImpExpTrees(importTree, exportTree));
         setLastUpdated(new Date());
         setExpandedIds(new Set());
       } catch (e: any) {
@@ -680,7 +1128,7 @@ export default function CgimAnalyticsPage() {
 
   const tickFob = React.useCallback((v: any) => formatMoneyUS(Number(v) || 0), []);
   const tickKg = React.useCallback((v: any) => formatKg(Number(v) || 0), []);
-  const tickPrice = React.useCallback((v: any) => formatUsdPerTon(Number(v) || 0), []);
+  const tickPrice = React.useCallback((v: any) => formatUsdPerTonTable(Number(v) || 0), []);
 
   // Aliases/formatters (mantém compatibilidade com o painel extraído)
   const tickUsd = tickFob;
@@ -771,6 +1219,7 @@ const compositionSubcategoryTextKg =
     setSelectedSubcategories([]);
     setExpandedIds(new Set());
     setTree([]);
+    setTableTree([]);
     setDictRowsAll([]);
     setDiagnostics(null);
     setError(null);
@@ -801,7 +1250,7 @@ const compositionSubcategoryTextKg =
   total={total}
   formatFOB={formatMoneyUS}
   formatKG={formatKg}
-  formatUsdPerTon={formatUsdPerTon}
+  formatUsdPerTon={formatUsdPerTonTable}
 
   diagnostics={diagnostics as any}
 
@@ -866,7 +1315,7 @@ const compositionSubcategoryTextKg =
           </div>
 
           <CgimHierarchyTable
-            tree={tree}
+            tree={tableTree}
             detailLevel={detailLevel}
             selectedCategories={selectedCategories}
             selectedSubcategories={selectedSubcategories}

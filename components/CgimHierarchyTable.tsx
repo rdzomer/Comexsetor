@@ -1,263 +1,564 @@
-// components/CgimHierarchyTable.tsx
-import React from "react";
-import type { DetailLevel, HierarchyNode, Metrics } from "../utils/cgimAggregation";
+// CgimHierarchyTable.tsx
+import React, { useMemo, useState } from "react";
 
-type SortKey = "fob" | "kg";
-type SortDir = "asc" | "desc";
+/**
+ * TABELA HIERÁRQUICA CGIM — EXIBIÇÃO ANALÍTICA COMPLETA
+ * - Não altera API/services/cálculos. Apenas exibição.
+ * - Estrutura: Categoria -> Subcategoria -> NCM
+ * - Totais já devem vir agregados por nível no objeto recebido.
+ *
+ * COMO USAR (exemplo):
+ * <CgimHierarchyTable data={hierarchyData} />
+ *
+ * Onde `hierarchyData` deve seguir o shape:
+ * {
+ *   categories: [
+ *     {
+ *       id: "iabr",
+ *       name: "Instituto Aço Brasil",
+ *       metrics: {...},
+ *       subcategories: [
+ *         {
+ *           id: "semiacabados",
+ *           name: "Semi-acabados",
+ *           metrics: {...},
+ *           ncms: [
+ *             { ncm: "7207.12.00", description: "...", metrics: {...} }
+ *           ]
+ *         }
+ *       ]
+ *     }
+ *   ]
+ * }
+ */
 
-export interface CgimHierarchyTableProps {
-  tree: HierarchyNode[];
+/** >>> AJUSTE AQUI SE SEUS NOMES DE CAMPO FOREM DIFERENTES <<< */
+export type Metrics = {
+  // Fluxos principais (já agregados por nível)
+  expFob?: number; // Exportação (US$ FOB)
+  expKg?: number; // Exportação (KG)
+  impFob?: number; // Importação (US$ FOB)
+  impKg?: number; // Importação (KG)
 
-  detailLevel: DetailLevel;
+  // Saldos (já prontos no objeto)
+  balanceFob?: number; // Saldo comercial (FOB)
+  balanceKg?: number; // Saldo comercial (KG)
 
-  // filtros
-  selectedCategories: string[];      // vazio = todas
-  selectedSubcategories: string[];   // vazio = todas (dentro das categorias selecionadas)
-
-  // expand/collapse
-  expandedIds: Set<string>;
-  onToggleExpand: (id: string) => void;
-
-  // ordenação
-  sortKey: SortKey;
-  sortDir: SortDir;
-  onChangeSort: (k: SortKey) => void;
-
-  // formatação
-  formatFOB?: (v: number) => string;
-  formatKG?: (v: number) => string;
-}
-
-type Row = {
-  node: HierarchyNode;
-  depth: number;
-  isVisible: boolean;
-  hasChildren: boolean;
-  isExpanded: boolean;
+  // Preço médio (já pronto no objeto) — US$/t
+  avgImpUsdPerTon?: number; // preço médio importação (US$/t)
+  avgExpUsdPerTon?: number; // preço médio exportação (US$/t)
 };
 
-function defaultFormatFOB(v: number): string {
-  // US$ com separador BR
-  return new Intl.NumberFormat("pt-BR", { maximumFractionDigits: 0 }).format(v);
+export type NcmNode = {
+  ncm: string;
+  description?: string;
+  metrics: Metrics;
+};
+
+export type SubcategoryNode = {
+  id: string;
+  name: string;
+  metrics: Metrics;
+  ncms?: NcmNode[];
+};
+
+export type CategoryNode = {
+  id: string;
+  name: string;
+  metrics: Metrics;
+  subcategories?: SubcategoryNode[];
+};
+
+export type CgimHierarchyData = {
+  categories: CategoryNode[];
+};
+
+type Props = {
+  data: CgimHierarchyData | null | undefined;
+
+  /** Opcional: controla se já abre tudo */
+  defaultExpandAll?: boolean;
+
+  /** Opcional: título exibido acima */
+  title?: string;
+
+  /** Opcional: altura máxima para scroll vertical (default: 520) */
+  maxHeightPx?: number;
+};
+
+type RowKind = "category" | "subcategory" | "ncm";
+
+type FlatRow = {
+  key: string;
+  kind: RowKind;
+  depth: number; // 0 categoria, 1 sub, 2 ncm
+  label: string;
+  secondary?: string; // descrição NCM etc.
+  metrics: Metrics;
+  categoryId: string;
+  subcategoryId?: string;
+};
+
+const styles: Record<string, React.CSSProperties> = {
+  container: {
+    border: "1px solid #E6E8EC",
+    borderRadius: 14,
+    background: "#fff",
+    overflow: "hidden",
+  },
+  headerBar: {
+    padding: "12px 14px",
+    borderBottom: "1px solid #E6E8EC",
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: 12,
+  },
+  title: {
+    fontSize: 14,
+    fontWeight: 700,
+    color: "#111827",
+  },
+  hint: {
+    fontSize: 12,
+    color: "#6B7280",
+  },
+  tableWrap: {
+    overflowX: "auto",
+    overflowY: "auto",
+  },
+  table: {
+    width: "100%",
+    borderCollapse: "separate",
+    borderSpacing: 0,
+    minWidth: 1180, // garante rolagem horizontal confortável com novas colunas
+    fontSize: 13,
+  },
+  theadTh: {
+    position: "sticky",
+    top: 0,
+    zIndex: 5,
+    background: "#F9FAFB",
+    color: "#111827",
+    borderBottom: "1px solid #E6E8EC",
+    padding: "10px 10px",
+    textAlign: "right",
+    fontWeight: 700,
+    whiteSpace: "nowrap",
+  },
+  theadThLeft: {
+    position: "sticky",
+    top: 0,
+    left: 0,
+    zIndex: 6,
+    background: "#F9FAFB",
+    color: "#111827",
+    borderBottom: "1px solid #E6E8EC",
+    padding: "10px 10px",
+    textAlign: "left",
+    fontWeight: 700,
+    whiteSpace: "nowrap",
+  },
+  tbodyTd: {
+    borderBottom: "1px solid #F1F2F4",
+    padding: "10px 10px",
+    textAlign: "right",
+    whiteSpace: "nowrap",
+    color: "#111827",
+  },
+  tbodyTdLeftSticky: {
+    position: "sticky",
+    left: 0,
+    zIndex: 4,
+    borderBottom: "1px solid #F1F2F4",
+    padding: "10px 10px",
+    textAlign: "left",
+    whiteSpace: "nowrap",
+    background: "#fff",
+  },
+  rowCategory: {
+    background: "#FFFFFF",
+    fontWeight: 700,
+  },
+  rowSubcategory: {
+    background: "#FFFFFF",
+    fontWeight: 600,
+  },
+  rowNcm: {
+    background: "#FFFFFF",
+    fontWeight: 500,
+  },
+  expandBtn: {
+    display: "inline-flex",
+    alignItems: "center",
+    justifyContent: "center",
+    width: 22,
+    height: 22,
+    borderRadius: 8,
+    border: "1px solid #E6E8EC",
+    background: "#fff",
+    cursor: "pointer",
+    marginRight: 8,
+    userSelect: "none",
+  },
+  pill: {
+    display: "inline-flex",
+    alignItems: "center",
+    gap: 6,
+    border: "1px solid #E6E8EC",
+    borderRadius: 999,
+    padding: "6px 10px",
+    fontSize: 12,
+    color: "#111827",
+    background: "#fff",
+  },
+  groupHead: {
+    background: "#F9FAFB",
+    borderBottom: "1px solid #E6E8EC",
+    textAlign: "center",
+    fontWeight: 800,
+  },
+  groupHeadStickyLeft: {
+    position: "sticky",
+    left: 0,
+    zIndex: 6,
+    background: "#F9FAFB",
+    borderBottom: "1px solid #E6E8EC",
+    textAlign: "left",
+    fontWeight: 800,
+  },
+};
+
+function formatIntBR(n?: number) {
+  if (n === null || n === undefined || Number.isNaN(n)) return "—";
+  return new Intl.NumberFormat("pt-BR", { maximumFractionDigits: 0 }).format(n);
 }
 
-function defaultFormatKG(v: number): string {
-  return new Intl.NumberFormat("pt-BR", { maximumFractionDigits: 0 }).format(v);
+function formatUsdBR(n?: number) {
+  if (n === null || n === undefined || Number.isNaN(n)) return "—";
+  // Mantém padrão do print: apenas número com separador BR, sem símbolo.
+  // Se você preferir "US$" colado, ajuste aqui.
+  return new Intl.NumberFormat("pt-BR", { maximumFractionDigits: 0 }).format(n);
 }
 
-function compareNumber(a: number, b: number, dir: SortDir): number {
-  const diff = a - b;
-  return dir === "asc" ? diff : -diff;
+function formatUsdPerTon(n?: number) {
+  if (n === null || n === undefined || Number.isNaN(n)) return "—";
+  return new Intl.NumberFormat("pt-BR", { minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(n);
 }
 
-function getMetric(m: Metrics, key: SortKey): number {
-  return key === "fob" ? m.fob : m.kg;
+function balanceColor(value?: number): React.CSSProperties {
+  if (value === null || value === undefined || Number.isNaN(value)) return {};
+  if (value > 0) return { color: "#0E7A2F" }; // verde
+  if (value < 0) return { color: "#B42318" }; // vermelho
+  return { color: "#111827" };
 }
 
-function allowedMaxDepth(detailLevel: DetailLevel): number {
-  // depth: 0=Categoria, 1=Subcategoria ou NCM direto, 2=NCM (quando há subcategoria)
-  if (detailLevel === "CATEGORY") return 0;
-  if (detailLevel === "SUBCATEGORY") return 1;
-  return 2;
+function indentStyle(depth: number): React.CSSProperties {
+  const pad = 10 + depth * 18;
+  return { paddingLeft: pad };
 }
 
-function nodePassesFilters(
-  node: HierarchyNode,
-  selectedCategories: Set<string>,
-  selectedSubcategories: Set<string>
-): boolean {
-  if (node.level === "category") {
-    return selectedCategories.size === 0 || selectedCategories.has(node.name);
-  }
+function makeChevron(open: boolean) {
+  // símbolo simples e neutro (evita dependências)
+  return open ? "▾" : "▸";
+}
 
-  // sub/ncm precisam respeitar categoria e subcategoria (se houver)
-  const cat = node.meta?.categoria;
-  const sub = node.meta?.subcategoria ?? null;
+export default function CgimHierarchyTable({
+  data,
+  defaultExpandAll = false,
+  title = "Tabela Analítica por Categoria / Subcategoria / NCM",
+  maxHeightPx = 520,
+}: Props) {
+  const categories = data?.categories ?? [];
 
-  if (selectedCategories.size && cat && !selectedCategories.has(cat)) return false;
-
-  // filtro de subcategoria só faz sentido quando a linha tem subcategoria
-  if (selectedSubcategories.size) {
-    if (node.level === "subcategory") return selectedSubcategories.has(node.name);
-    if (node.level === "ncm") {
-      // se NCM tem subcategoria, precisa estar selecionada; se não tem, passa (porque não existe)
-      if (sub) return selectedSubcategories.has(sub);
-      return true;
+  const allCategoryIds = useMemo(() => categories.map((c) => c.id), [categories]);
+  const allSubcategoryKeys = useMemo(() => {
+    const keys: string[] = [];
+    for (const c of categories) {
+      for (const s of c.subcategories ?? []) keys.push(`${c.id}__${s.id}`);
     }
-  }
+    return keys;
+  }, [categories]);
 
-  return true;
-}
+  const [openCategories, setOpenCategories] = useState<Set<string>>(
+    () => new Set(defaultExpandAll ? allCategoryIds : [])
+  );
+  const [openSubcategories, setOpenSubcategories] = useState<Set<string>>(
+    () => new Set(defaultExpandAll ? allSubcategoryKeys : [])
+  );
 
-function sortChildren(node: HierarchyNode, sortKey: SortKey, sortDir: SortDir): HierarchyNode {
-  if (!node.children?.length) return node;
+  // Re-sincroniza expansão caso data troque (evita estado “fantasma”)
+  React.useEffect(() => {
+    if (!defaultExpandAll) return;
+    setOpenCategories(new Set(allCategoryIds));
+    setOpenSubcategories(new Set(allSubcategoryKeys));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [defaultExpandAll, allCategoryIds.join("|"), allSubcategoryKeys.join("|")]);
 
-  const children = [...node.children].map((c) => sortChildren(c, sortKey, sortDir));
+  const flatRows: FlatRow[] = useMemo(() => {
+    const rows: FlatRow[] = [];
 
-  children.sort((a, b) => {
-    // Mantém categorias/subcategorias acima de NCM (quando misturado)
-    if (a.level !== b.level) {
-      const order = (lvl: string) => (lvl === "subcategory" ? 0 : lvl === "ncm" ? 1 : 2);
-      return order(a.level) - order(b.level);
-    }
-    // Entre nós do mesmo nível, ordena por métrica (desc padrão)
-    return compareNumber(getMetric(a.metrics, sortKey), getMetric(b.metrics, sortKey), sortDir);
-  });
+    for (const c of categories) {
+      rows.push({
+        key: `cat:${c.id}`,
+        kind: "category",
+        depth: 0,
+        label: c.name,
+        metrics: c.metrics ?? {},
+        categoryId: c.id,
+      });
 
-  return { ...node, children };
-}
+      const catOpen = openCategories.has(c.id);
+      if (!catOpen) continue;
 
-export const CgimHierarchyTable: React.FC<CgimHierarchyTableProps> = ({
-  tree,
-  detailLevel,
-  selectedCategories,
-  selectedSubcategories,
-  expandedIds,
-  onToggleExpand,
-  sortKey,
-  sortDir,
-  onChangeSort,
-  formatFOB = defaultFormatFOB,
-  formatKG = defaultFormatKG,
-}) => {
-  const maxDepth = allowedMaxDepth(detailLevel);
-
-  const catSet = React.useMemo(() => new Set(selectedCategories.filter(Boolean)), [selectedCategories]);
-  const subSet = React.useMemo(() => new Set(selectedSubcategories.filter(Boolean)), [selectedSubcategories]);
-
-  const sortedTree = React.useMemo(() => {
-    // ordena top-level também por métrica
-    const nodes = (tree ?? []).map((n) => sortChildren(n, sortKey, sortDir));
-    return [...nodes].sort((a, b) => compareNumber(getMetric(a.metrics, sortKey), getMetric(b.metrics, sortKey), sortDir));
-  }, [tree, sortKey, sortDir]);
-
-  const rows = React.useMemo<Row[]>(() => {
-    const out: Row[] = [];
-
-    function walk(node: HierarchyNode, depth: number, parentVisible: boolean) {
-      const passes = nodePassesFilters(node, catSet, subSet);
-      const isVisible = parentVisible && passes;
-
-      // Regra de corte por nível: se depth > maxDepth, não renderiza (mas pode ser usado para somas já prontas)
-      if (depth <= maxDepth) {
-        const hasChildren = Boolean(node.children && node.children.length && depth < maxDepth);
-        const isExpanded = expandedIds.has(node.id);
-
-        out.push({
-          node,
-          depth,
-          isVisible,
-          hasChildren,
-          isExpanded,
+      for (const s of c.subcategories ?? []) {
+        const subKey = `${c.id}__${s.id}`;
+        rows.push({
+          key: `sub:${subKey}`,
+          kind: "subcategory",
+          depth: 1,
+          label: s.name,
+          metrics: s.metrics ?? {},
+          categoryId: c.id,
+          subcategoryId: s.id,
         });
 
-        // Só desce se (a) tem filhos, (b) está expandido, (c) ainda não passou do maxDepth
-        if (hasChildren && isExpanded) {
-          for (const ch of node.children ?? []) walk(ch, depth + 1, isVisible);
+        const subOpen = openSubcategories.has(subKey);
+        if (!subOpen) continue;
+
+        for (const n of s.ncms ?? []) {
+          rows.push({
+            key: `ncm:${subKey}__${n.ncm}`,
+            kind: "ncm",
+            depth: 2,
+            label: n.ncm,
+            secondary: n.description,
+            metrics: n.metrics ?? {},
+            categoryId: c.id,
+            subcategoryId: s.id,
+          });
         }
       }
     }
 
-    for (const top of sortedTree) walk(top, 0, true);
+    return rows;
+  }, [categories, openCategories, openSubcategories]);
 
-    return out.filter((r) => r.isVisible);
-  }, [sortedTree, expandedIds, catSet, subSet, maxDepth]);
+  function toggleCategory(catId: string) {
+    setOpenCategories((prev) => {
+      const next = new Set(prev);
+      if (next.has(catId)) next.delete(catId);
+      else next.add(catId);
+      return next;
+    });
+  }
 
-  const headerBtnStyle: React.CSSProperties = {
-    background: "transparent",
-    border: "none",
-    cursor: "pointer",
-    fontWeight: 700,
-    padding: 0,
-  };
+  function toggleSubcategory(catId: string, subId: string) {
+    const key = `${catId}__${subId}`;
+    setOpenSubcategories((prev) => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
+  }
 
-  const cellStyle: React.CSSProperties = { padding: "10px 12px", borderBottom: "1px solid #eee", verticalAlign: "middle" };
+  function expandAll() {
+    setOpenCategories(new Set(allCategoryIds));
+    setOpenSubcategories(new Set(allSubcategoryKeys));
+  }
+
+  function collapseAll() {
+    setOpenCategories(new Set());
+    setOpenSubcategories(new Set());
+  }
+
+  const hasAny = categories.length > 0;
 
   return (
-    <div style={{ border: "1px solid #e6e6e6", borderRadius: 10, overflow: "hidden" }}>
-      <table style={{ width: "100%", borderCollapse: "collapse" }}>
-        <thead>
-          <tr style={{ background: "#fafafa" }}>
-            <th style={{ ...cellStyle, textAlign: "left" }}>Estrutura</th>
-            <th style={{ ...cellStyle, textAlign: "right", width: 180 }}>
-              <button style={headerBtnStyle} onClick={() => onChangeSort("fob")} title="Ordenar por FOB">
-                FOB {sortKey === "fob" ? (sortDir === "desc" ? "↓" : "↑") : ""}
-              </button>
-            </th>
-            <th style={{ ...cellStyle, textAlign: "right", width: 180 }}>
-              <button style={headerBtnStyle} onClick={() => onChangeSort("kg")} title="Ordenar por KG">
-                KG {sortKey === "kg" ? (sortDir === "desc" ? "↓" : "↑") : ""}
-              </button>
-            </th>
-          </tr>
-        </thead>
+    <div style={styles.container}>
+      <div style={styles.headerBar}>
+        <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+          <div style={styles.title}>{title}</div>
+          <div style={styles.hint}>
+            Colunas: Exportação, Importação, Balança, Preço médio (US$/t). Totais por nível já vêm agregados.
+          </div>
+        </div>
 
-        <tbody>
-          {rows.length === 0 ? (
+        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <span style={styles.pill} title="Expande todas as categorias e subcategorias">
+            <button
+              type="button"
+              onClick={expandAll}
+              style={{
+                border: "none",
+                background: "transparent",
+                cursor: "pointer",
+                padding: 0,
+                fontSize: 12,
+                fontWeight: 700,
+                color: "#111827",
+              }}
+            >
+              Expandir tudo
+            </button>
+          </span>
+
+          <span style={styles.pill} title="Recolhe todas as categorias e subcategorias">
+            <button
+              type="button"
+              onClick={collapseAll}
+              style={{
+                border: "none",
+                background: "transparent",
+                cursor: "pointer",
+                padding: 0,
+                fontSize: 12,
+                fontWeight: 700,
+                color: "#111827",
+              }}
+            >
+              Recolher tudo
+            </button>
+          </span>
+        </div>
+      </div>
+
+      <div style={{ ...styles.tableWrap, maxHeight: maxHeightPx }}>
+        <table style={styles.table}>
+          <thead>
+            {/* Linha 1: agrupamento visual (melhora legibilidade sem mudar layout geral) */}
             <tr>
-              <td style={{ ...cellStyle, padding: 16 }} colSpan={3}>
-                Nenhum dado para exibir com os filtros atuais.
-              </td>
+              <th style={{ ...styles.groupHeadStickyLeft, padding: "10px 10px" }}>Hierarquia</th>
+              <th style={styles.groupHead} colSpan={2} title="Exportações">
+                EXP
+              </th>
+              <th style={styles.groupHead} colSpan={2} title="Importações">
+                IMP
+              </th>
+              <th style={styles.groupHead} colSpan={2} title="Saldo comercial (Exportação - Importação)">
+                BALANÇA
+              </th>
+              <th style={styles.groupHead} colSpan={2} title="Preço médio (US$/t) — já fornecido pelo objeto">
+                PREÇO MÉDIO (US$/t)
+              </th>
             </tr>
-          ) : (
-            rows.map(({ node, depth, hasChildren, isExpanded }) => {
-              const indent = depth * 18;
 
-              const labelWeight =
-                node.level === "category" ? 800 : node.level === "subcategory" ? 700 : 500;
+            {/* Linha 2: colunas finais (como no print) */}
+            <tr>
+              <th style={styles.theadThLeft}>Categoria / Subcategoria / NCM</th>
 
-              const labelPrefix =
-                node.level === "category" ? "Categoria" : node.level === "subcategory" ? "Subcategoria" : "NCM";
+              <th style={styles.theadTh} title="Exportação (US$ FOB)">EXP (US$ FOB)</th>
+              <th style={styles.theadTh} title="Exportação (KG)">EXP (KG)</th>
+
+              <th style={styles.theadTh} title="Importação (US$ FOB)">IMP (US$ FOB)</th>
+              <th style={styles.theadTh} title="Importação (KG)">IMP (KG)</th>
+
+              <th style={styles.theadTh} title="Saldo comercial (US$ FOB)">BALANÇA (FOB)</th>
+              <th style={styles.theadTh} title="Saldo comercial (KG)">BALANÇA (KG)</th>
+
+              <th style={styles.theadTh} title="Preço médio de importação (US$/t)">PM IMP (US$/t)</th>
+              <th style={styles.theadTh} title="Preço médio de exportação (US$/t)">PM EXP (US$/t)</th>
+            </tr>
+          </thead>
+
+          <tbody>
+            {!hasAny && (
+              <tr>
+                <td
+                  colSpan={9}
+                  style={{
+                    padding: 18,
+                    color: "#6B7280",
+                    fontSize: 13,
+                    textAlign: "left",
+                  }}
+                >
+                  Nenhum dado para exibir.
+                </td>
+              </tr>
+            )}
+
+            {flatRows.map((r) => {
+              const isCategory = r.kind === "category";
+              const isSub = r.kind === "subcategory";
+              const isNcm = r.kind === "ncm";
+
+              const rowStyle =
+                isCategory ? styles.rowCategory : isSub ? styles.rowSubcategory : styles.rowNcm;
+
+              const canExpand =
+                (isCategory && (categories.find((c) => c.id === r.categoryId)?.subcategories?.length ?? 0) > 0) ||
+                (isSub &&
+                  (categories
+                    .find((c) => c.id === r.categoryId)
+                    ?.subcategories?.find((s) => s.id === r.subcategoryId)
+                    ?.ncms?.length ?? 0) > 0);
+
+              const isOpen = isCategory
+                ? openCategories.has(r.categoryId)
+                : isSub
+                ? openSubcategories.has(`${r.categoryId}__${r.subcategoryId}`)
+                : false;
 
               return (
-                <tr key={node.id}>
-                  <td style={{ ...cellStyle, textAlign: "left" }}>
-                    <div style={{ display: "flex", alignItems: "center", gap: 8, paddingLeft: indent }}>
-                      {hasChildren ? (
+                <tr key={r.key} style={rowStyle}>
+                  {/* Coluna esquerda sticky */}
+                  <td style={{ ...styles.tbodyTdLeftSticky, ...indentStyle(r.depth) }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                      {canExpand ? (
                         <button
-                          onClick={() => onToggleExpand(node.id)}
-                          style={{
-                            width: 26,
-                            height: 26,
-                            borderRadius: 6,
-                            border: "1px solid #ddd",
-                            background: "#fff",
-                            cursor: "pointer",
-                            fontWeight: 800,
+                          type="button"
+                          style={styles.expandBtn}
+                          onClick={() => {
+                            if (isCategory) toggleCategory(r.categoryId);
+                            if (isSub && r.subcategoryId) toggleSubcategory(r.categoryId, r.subcategoryId);
                           }}
-                          aria-label={isExpanded ? "Recolher" : "Expandir"}
+                          aria-label={isOpen ? "Recolher" : "Expandir"}
+                          title={isOpen ? "Recolher" : "Expandir"}
                         >
-                          {isExpanded ? "–" : "+"}
+                          {makeChevron(isOpen)}
                         </button>
                       ) : (
-                        <div style={{ width: 26 }} />
+                        <span style={{ width: 22, display: "inline-block" }} />
                       )}
 
-                      <div>
-                        <div style={{ fontWeight: labelWeight }}>
-                          {node.name}
-                        </div>
-                        <div style={{ fontSize: 12, opacity: 0.65 }}>
-                          {labelPrefix}
-                          {node.level === "ncm" && node.meta?.categoria ? ` • ${node.meta.categoria}${node.meta.subcategoria ? ` / ${node.meta.subcategoria}` : ""}` : ""}
-                        </div>
+                      <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+                        <span style={{ color: "#111827" }}>{r.label}</span>
+                        {isNcm && r.secondary ? (
+                          <span style={{ fontSize: 12, color: "#6B7280" }} title={r.secondary}>
+                            {r.secondary.length > 80 ? r.secondary.slice(0, 80) + "…" : r.secondary}
+                          </span>
+                        ) : null}
                       </div>
                     </div>
                   </td>
 
-                  <td style={{ ...cellStyle, textAlign: "right", fontVariantNumeric: "tabular-nums" }}>
-                    {formatFOB(node.metrics.fob)}
+                  {/* EXP */}
+                  <td style={styles.tbodyTd}>{formatUsdBR(r.metrics.expFob)}</td>
+                  <td style={styles.tbodyTd}>{formatIntBR(r.metrics.expKg)}</td>
+
+                  {/* IMP */}
+                  <td style={styles.tbodyTd}>{formatUsdBR(r.metrics.impFob)}</td>
+                  <td style={styles.tbodyTd}>{formatIntBR(r.metrics.impKg)}</td>
+
+                  {/* BALANÇA */}
+                  <td style={{ ...styles.tbodyTd, ...balanceColor(r.metrics.balanceFob) }}>
+                    {formatUsdBR(r.metrics.balanceFob)}
+                  </td>
+                  <td style={{ ...styles.tbodyTd, ...balanceColor(r.metrics.balanceKg) }}>
+                    {formatIntBR(r.metrics.balanceKg)}
                   </td>
 
-                  <td style={{ ...cellStyle, textAlign: "right", fontVariantNumeric: "tabular-nums" }}>
-                    {formatKG(node.metrics.kg)}
-                  </td>
+                  {/* PREÇO MÉDIO */}
+                  <td style={styles.tbodyTd}>{formatUsdPerTon(r.metrics.avgImpUsdPerTon)}</td>
+                  <td style={styles.tbodyTd}>{formatUsdPerTon(r.metrics.avgExpUsdPerTon)}</td>
                 </tr>
               );
-            })
-          )}
-        </tbody>
-      </table>
+            })}
+          </tbody>
+        </table>
+      </div>
     </div>
   );
-};
+}
