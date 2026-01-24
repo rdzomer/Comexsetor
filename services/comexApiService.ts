@@ -47,7 +47,6 @@ const BASE_URLS = [
 
   // hosts legados (fallback)
   "https://api.comexstat.mdic.gov.br/general?filter=",
-  "http://api.comexstat.mdic.gov.br/general?filter=",
 ];
 
 // Endpoint de atualização mudou na API nova. Mantemos múltiplas tentativas.
