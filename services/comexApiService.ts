@@ -1,13 +1,13 @@
 // services/comexApiService.ts
-// ✅ CONTRATO LEGADO do App.tsx + ✅ export extra para o CGIM (fetchComexYearByNcm)
-// Não remova exports daqui enquanto App.tsx depender deles.
+// ✅ CONTRATO LEGADO do App.tsx + ✅ exports CGIM (inclui fetchComexYearByNcmList)
+// Não remova exports daqui enquanto App.tsx / CGIM dependerem deles.
 
 import type { NcmYearValue } from "../utils/cgimTypes";
 
 export type TradeFlowUi = "import" | "export"; // usado pelo App
 export type TradeFlow = "imp" | "exp"; // usado pelo CGIM
 
-// ✅ (NOVO) Linha anual por NCM (para retorno em lote do CGIM)
+// ✅ Linha anual por NCM (para retorno em lote do CGIM)
 export type NcmYearRow = { ncm: string; fob: number; kg: number };
 
 export interface LastUpdateData {
@@ -37,37 +37,26 @@ export interface CountryDataRecord {
 }
 
 // ===== CONFIG =====
-// ⚠️ IMPORTANTÍSSIMO:
-// A API nova usa o host com hífen: api-comexstat.mdic.gov.br
-// Mantemos também os hosts legados como fallback para não quebrar nada.
 const PROD = import.meta.env.PROD;
 
-// Em produção (Netlify): o browser chama o nosso próprio domínio (/api/comex/*),
-// e uma Netlify Function faz o proxy para a API do ComexStat.
-// Em desenvolvimento (local): mantemos chamada direta para continuar funcionando no npm run dev.
+// Em produção (Netlify): browser chama o nosso domínio (/api/comex/*) e function faz proxy.
+// Em dev (local): chamada direta para funcionar no npm run dev.
 const BASE_URLS = PROD
   ? [
       // ✅ Em produção: SOMENTE via proxy Netlify (evita 451/CORS/Mixed Content no browser)
       "/api/comex/general?filter=",
     ]
   : [
-      // ✅ Em desenvolvimento local: chamadas diretas continuam funcionando no npm run dev
+      // ✅ Em desenvolvimento local
       "https://api-comexstat.mdic.gov.br/general?filter=",
       "http://api-comexstat.mdic.gov.br/general?filter=",
       "https://api.comexstat.mdic.gov.br/general?filter=",
     ];
 
-// Endpoint de atualização mudou na API nova. Mantemos múltiplas tentativas.
 const LAST_UPDATE_ENDPOINTS = PROD
-  ? [
-      // ✅ Em produção: SOMENTE via proxy Netlify
-      "/api/comex/general/dates/updated",
-    ]
+  ? ["/api/comex/general/dates/updated"]
   : [
-      // ✅ API nova (local)
       "https://api-comexstat.mdic.gov.br/general/dates/updated",
-
-      // ✅ API legada / variações
       "https://api.comexstat.mdic.gov.br/general/lastUpdate",
       "https://api.comexstat.mdic.gov.br/general/lastupdate",
       "https://api.comexstat.mdic.gov.br/general/last-update",
@@ -92,11 +81,15 @@ function parseYearMonth(s: string): { year: number; month: number } | null {
   return { year, month };
 }
 
-function periodToYM(period: Period): { yearStart: number; monthStart: number; yearEnd: number; monthEnd: number } {
+function periodToYM(period: Period): {
+  yearStart: number;
+  monthStart: number;
+  yearEnd: number;
+  monthEnd: number;
+} {
   const f = parseYearMonth(period.from);
   const t = parseYearMonth(period.to);
   if (!f || !t) {
-    // fallback defensivo
     const now = new Date();
     const year = now.getFullYear();
     const month = now.getMonth() + 1;
@@ -108,7 +101,6 @@ function periodToYM(period: Period): { yearStart: number; monthStart: number; ye
 function normalizeNcmLoose(ncm: string): string {
   const only = String(ncm || "").replace(/\D/g, "");
   if (only.length === 0) return "";
-  // não força 8; mantém como vem (muitas telas usam 6/8)
   return only;
 }
 
@@ -123,8 +115,8 @@ async function tryFetchJson(url: string, ms = 25_000): Promise<any> {
   const ct = res.headers.get("content-type") || "";
   const isJson = ct.includes("application/json") || ct.includes("text/json");
   const text = await res.text();
+
   if (!res.ok) {
-    // tenta extrair msg
     let msg = text;
     try {
       if (isJson) {
@@ -136,15 +128,16 @@ async function tryFetchJson(url: string, ms = 25_000): Promise<any> {
     }
     throw new Error(`HTTP ${res.status} - ${msg}`);
   }
+
   if (isJson) {
     try {
       return JSON.parse(text);
     } catch {
-      // fallback para retorno não-JSON
       return text;
     }
   }
-  // às vezes a API devolve JSON com content-type errado
+
+  // às vezes vem JSON com content-type errado
   try {
     return JSON.parse(text);
   } catch {
@@ -164,9 +157,6 @@ export async function fetchLastUpdate(): Promise<LastUpdateData> {
     try {
       const json = await tryFetchJson(url, 20_000);
 
-      // Formatos possíveis:
-      // - API nova: { year, month } OU { data: { year, month } }
-      // - API legada: { lastUpdate: "YYYY-MM" } etc.
       const directYear = Number(json?.year ?? json?.data?.year);
       const directMonth = Number(json?.month ?? json?.data?.month);
       if (Number.isFinite(directYear) && Number.isFinite(directMonth)) {
@@ -186,7 +176,6 @@ export async function fetchLastUpdate(): Promise<LastUpdateData> {
         if (ym) return { year: ym.year, month: ym.month };
       }
 
-      // tentativa de achar no payload
       const maybe = json?.data;
       if (typeof maybe === "string") {
         const ym = parseYearMonth(maybe);
@@ -205,14 +194,8 @@ export async function fetchNcmDescription(ncm: string): Promise<string> {
   if (!n) return "";
 
   const candidates = PROD
-    ? [
-        // ✅ Em produção: via proxy Netlify (evita 451/CORS)
-        `/api/comex/tables/ncm/${n}`,
-        `/api/comex/tables/ncm?code=${n}`,
-        `/api/comex/tables/ncm?noNcm=${n}`,
-      ]
+    ? [`/api/comex/tables/ncm/${n}`, `/api/comex/tables/ncm?code=${n}`, `/api/comex/tables/ncm?noNcm=${n}`]
     : [
-        // ✅ Em desenvolvimento: direto (funciona no npm run dev)
         `https://api.comexstat.mdic.gov.br/tables/ncm/${n}`,
         `https://api.comexstat.mdic.gov.br/tables/ncm?code=${n}`,
         `https://api.comexstat.mdic.gov.br/tables/ncm?noNcm=${n}`,
@@ -243,14 +226,8 @@ export async function fetchNcmUnit(ncm: string): Promise<string> {
   if (!n) return "";
 
   const candidates = PROD
-    ? [
-        // ✅ Em produção: via proxy Netlify (evita 451/CORS)
-        `/api/comex/tables/ncm/${n}`,
-        `/api/comex/tables/ncm?code=${n}`,
-        `/api/comex/tables/ncm?noNcm=${n}`,
-      ]
+    ? [`/api/comex/tables/ncm/${n}`, `/api/comex/tables/ncm?code=${n}`, `/api/comex/tables/ncm?noNcm=${n}`]
     : [
-        // ✅ Em desenvolvimento: direto (funciona no npm run dev)
         `https://api.comexstat.mdic.gov.br/tables/ncm/${n}`,
         `https://api.comexstat.mdic.gov.br/tables/ncm?code=${n}`,
         `https://api.comexstat.mdic.gov.br/tables/ncm?noNcm=${n}`,
@@ -287,18 +264,14 @@ async function comexGeneralRequest(filterObj: any): Promise<any[]> {
     const url = `${base}${filter}`;
     try {
       const json = await tryFetchJson(url, 35_000);
-      // API costuma devolver { data: [...] } ou direto [...]
       const data = Array.isArray(json) ? json : json?.data;
       if (Array.isArray(data)) return data;
-      // fallback: se veio algo inesperado
       return [];
     } catch (err: any) {
       lastErr = err;
-      // tenta próximo base
     }
   }
 
-  // erro final
   console.warn("[comexApiService] Falha ao consultar ComexStat. Retornando lista vazia. Error:", lastErr);
   return [];
 }
@@ -307,11 +280,7 @@ async function comexGeneralRequest(filterObj: any): Promise<any[]> {
 // ✅ EXPORTS LEGADOS USADOS PELO APP
 // ===============================
 
-export async function fetchComexDataByNcm(
-  ncm: string,
-  year: number,
-  flowUi: TradeFlowUi
-): Promise<ComexStatRecord[]> {
+export async function fetchComexDataByNcm(ncm: string, year: number, flowUi: TradeFlowUi): Promise<ComexStatRecord[]> {
   const n = normalizeNcmLoose(ncm);
   const typeForm = toApiTypeFormFromUi(flowUi);
 
@@ -376,24 +345,14 @@ export async function fetchComexCountryDataByNcm(
   const n = normalizeNcmLoose(ncm);
   const typeForm = toApiTypeFormFromUi(flowUi);
 
-  // Para país: muda o detailDatabase e/ou filtros conforme API.
-  // Mantemos o comportamento anterior: pedir por "noCountry" se necessário.
   const filterObj = {
     yearStart: String(year),
     yearEnd: String(year),
     typeForm,
     typeOrder: 1,
     filterList: [
-      {
-        id: "noNcm",
-        filterArray: [n],
-        detailDatabase: [{ id: "noNcmpt", text: "" }],
-      },
-      {
-        id: "noCountry",
-        filterArray: [],
-        detailDatabase: [{ id: "noCountry", text: "" }],
-      },
+      { id: "noNcm", filterArray: [n], detailDatabase: [{ id: "noNcmpt", text: "" }] },
+      { id: "noCountry", filterArray: [], detailDatabase: [{ id: "noCountry", text: "" }] },
     ],
     monthDetail: false,
     metricFOB: true,
@@ -417,13 +376,10 @@ export async function fetchComexCountryDataByNcm(
 }
 
 // ===============================
-// ✅ EXPORT EXTRA para CGIM: (batch anual por NCM)
+// ✅ EXPORTS CGIM: batch anual por NCM
 // ===============================
-export async function fetchComexYearByNcm(
-  ncms: string[],
-  year: number,
-  flow: TradeFlow
-): Promise<NcmYearValue[]> {
+
+export async function fetchComexYearByNcm(ncms: string[], year: number, flow: TradeFlow): Promise<NcmYearValue[]> {
   const list = (ncms || []).map(normalizeNcmLoose).filter(Boolean);
   if (!list.length) return [];
 
@@ -434,19 +390,10 @@ export async function fetchComexYearByNcm(
     yearEnd: String(year),
     typeForm,
     typeOrder: 1,
-    filterList: [
-      {
-        id: "noNcm",
-        filterArray: list,
-        detailDatabase: [{ id: "noNcmpt", text: "" }],
-      },
-    ],
-    // anual (sem mês)
+    filterList: [{ id: "noNcm", filterArray: list, detailDatabase: [{ id: "noNcmpt", text: "" }] }],
     monthDetail: false,
-    // métricas principais do CGIM
     metricFOB: true,
     metricKG: true,
-    // outros desligados
     metricStatistic: false,
     metricCIF: false,
     metricFreight: false,
@@ -459,7 +406,6 @@ export async function fetchComexYearByNcm(
 
   const rows = (await comexGeneralRequest(filterObj)) as any[];
 
-  // Normaliza retorno para { ncm, fob, kg }
   const map = new Map<string, NcmYearValue>();
   for (const r of rows || []) {
     const ncm = normalizeNcmLoose(r?.noNcm ?? r?.ncm ?? r?.code ?? "");
@@ -471,6 +417,18 @@ export async function fetchComexYearByNcm(
     map.set(ncm, { ncm, fob, kg });
   }
 
-  // garante todos (inclusive zeros)
   return list.map((n) => map.get(n) || { ncm: n, fob: 0, kg: 0 });
+}
+
+/**
+ * ✅ COMPAT: alguns serviços CGIM importam "fetchComexYearByNcmList" e "NcmYearRow".
+ * Esta função mantém o mesmo papel: retorna lista de { ncm, fob, kg }.
+ */
+export async function fetchComexYearByNcmList(
+  ncms: string[],
+  year: number,
+  flow: TradeFlow
+): Promise<NcmYearRow[]> {
+  const values = await fetchComexYearByNcm(ncms, year, flow);
+  return (values || []).map((v) => ({ ncm: v.ncm, fob: v.fob, kg: v.kg }));
 }
