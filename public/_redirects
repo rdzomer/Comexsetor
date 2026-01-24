@@ -1,0 +1,2 @@
+/api/comex/*  https://api-comexstat.mdic.gov.br/:splat  200
+/*            /index.html                               200
