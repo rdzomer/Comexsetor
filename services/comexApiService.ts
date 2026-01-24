@@ -1,6 +1,5 @@
 // services/comexApiService.ts
-// ✅ CONTRATO LEGADO do App.tsx + ✅ exports CGIM (inclui fetchComexYearByNcmList)
-// Não remova exports daqui enquanto App.tsx / CGIM dependerem deles.
+// ✅ CONTRATO LEGADO do App.tsx + ✅ exports CGIM (inclui fetchComexYearByNcmList + fetchComexData compat)
 
 import type { NcmYearValue } from "../utils/cgimTypes";
 
@@ -422,7 +421,6 @@ export async function fetchComexYearByNcm(ncms: string[], year: number, flow: Tr
 
 /**
  * ✅ COMPAT: alguns serviços CGIM importam "fetchComexYearByNcmList" e "NcmYearRow".
- * Esta função mantém o mesmo papel: retorna lista de { ncm, fob, kg }.
  */
 export async function fetchComexYearByNcmList(
   ncms: string[],
@@ -431,4 +429,34 @@ export async function fetchComexYearByNcmList(
 ): Promise<NcmYearRow[]> {
   const values = await fetchComexYearByNcm(ncms, year, flow);
   return (values || []).map((v) => ({ ncm: v.ncm, fob: v.fob, kg: v.kg }));
+}
+
+/**
+ * ✅ COMPAT LEGADA: alguns serviços importam "fetchComexData".
+ * Este wrapper aceita chamadas comuns (ano ou período) sem quebrar os módulos.
+ *
+ * Padrões suportados:
+ *  - fetchComexData(ncm, year, flowUi)
+ *  - fetchComexData(ncm, period, flowUi)
+ */
+export async function fetchComexData(ncm: string, year: number, flowUi: TradeFlowUi): Promise<ComexStatRecord[]>;
+export async function fetchComexData(
+  ncm: string,
+  period: Period,
+  flowUi: TradeFlowUi
+): Promise<MonthlyComexStatRecord[]>;
+export async function fetchComexData(ncm: string, a: any, b: any): Promise<any[]> {
+  // (ncm, year:number, flowUi)
+  if (typeof a === "number" && (b === "import" || b === "export")) {
+    return await fetchComexDataByNcm(ncm, a, b);
+  }
+
+  // (ncm, period: {from,to}, flowUi)
+  if (a && typeof a === "object" && typeof a.from === "string" && typeof a.to === "string" && (b === "import" || b === "export")) {
+    return await fetchComexDataByNcmPeriod(ncm, a as Period, b as TradeFlowUi);
+  }
+
+  // fallback defensivo
+  console.warn("[comexApiService] fetchComexData chamado com assinatura inesperada:", { ncm, a, b });
+  return [];
 }
