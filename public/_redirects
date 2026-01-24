@@ -1,2 +1,2 @@
-/api/comex/*  https://api-comexstat.mdic.gov.br/:splat  200
-/*            /index.html                               200
+/api/comex/*  /.netlify/functions/comex/:splat  200
+/*            /index.html                       200

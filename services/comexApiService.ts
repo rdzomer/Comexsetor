@@ -40,25 +40,46 @@ export interface CountryDataRecord {
 // ⚠️ IMPORTANTÍSSIMO:
 // A API nova usa o host com hífen: api-comexstat.mdic.gov.br
 // Mantemos também os hosts legados como fallback para não quebrar nada.
-const BASE_URLS = [
-  // host atual (principal)
-  "https://api-comexstat.mdic.gov.br/general?filter=",
-  "http://api-comexstat.mdic.gov.br/general?filter=",
+const PROD = import.meta.env.PROD;
 
-  // hosts legados (fallback)
-  "https://api.comexstat.mdic.gov.br/general?filter=",
-];
+// Em produção (Netlify): o browser chama o nosso próprio domínio (/api/comex/*),
+// e uma Netlify Function faz o proxy para a API do ComexStat.
+// Em desenvolvimento (local): mantemos chamada direta para continuar funcionando no npm run dev.
+const BASE_URLS = PROD
+  ? [
+      "/api/comex/general?filter=",
+      // fallback (caso o proxy esteja indisponível)
+      "https://api-comexstat.mdic.gov.br/general?filter=",
+    ]
+  : [
+      "https://api-comexstat.mdic.gov.br/general?filter=",
+      "http://api-comexstat.mdic.gov.br/general?filter=",
+      "https://api.comexstat.mdic.gov.br/general?filter=",
+    ];
+
 
 // Endpoint de atualização mudou na API nova. Mantemos múltiplas tentativas.
-const LAST_UPDATE_ENDPOINTS = [
-  // API nova
-  "https://api-comexstat.mdic.gov.br/general/dates/updated",
+const LAST_UPDATE_ENDPOINTS = PROD
+  ? [
+      // via proxy (produção)
+      "/api/comex/general/dates/updated",
 
-  // API legada / variações
-  "https://api.comexstat.mdic.gov.br/general/lastUpdate",
-  "https://api.comexstat.mdic.gov.br/general/lastupdate",
-  "https://api.comexstat.mdic.gov.br/general/last-update",
-];
+      // fallbacks diretos
+      "https://api-comexstat.mdic.gov.br/general/dates/updated",
+      "https://api.comexstat.mdic.gov.br/general/lastUpdate",
+      "https://api.comexstat.mdic.gov.br/general/lastupdate",
+      "https://api.comexstat.mdic.gov.br/general/last-update",
+    ]
+  : [
+      // API nova (local)
+      "https://api-comexstat.mdic.gov.br/general/dates/updated",
+
+      // API legada / variações
+      "https://api.comexstat.mdic.gov.br/general/lastUpdate",
+      "https://api.comexstat.mdic.gov.br/general/lastupdate",
+      "https://api.comexstat.mdic.gov.br/general/last-update",
+    ];
+
 
 // ===== HELPERS =====
 
