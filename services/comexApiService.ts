@@ -1,5 +1,5 @@
 // services/comexApiService.ts
-// ✅ CONTRATO LEGADO do App.tsx + ✅ exports CGIM (inclui fetchComexYearByNcmList + fetchComexData compat)
+// ✅ CONTRATO LEGADO do App.tsx + ✅ exports CGIM (inclui fetchComexYearByNcmList + fetchComexData compat + fetchLastUpdateData compat)
 
 import type { NcmYearValue } from "../utils/cgimTypes";
 
@@ -433,11 +433,6 @@ export async function fetchComexYearByNcmList(
 
 /**
  * ✅ COMPAT LEGADA: alguns serviços importam "fetchComexData".
- * Este wrapper aceita chamadas comuns (ano ou período) sem quebrar os módulos.
- *
- * Padrões suportados:
- *  - fetchComexData(ncm, year, flowUi)
- *  - fetchComexData(ncm, period, flowUi)
  */
 export async function fetchComexData(ncm: string, year: number, flowUi: TradeFlowUi): Promise<ComexStatRecord[]>;
 export async function fetchComexData(
@@ -446,17 +441,25 @@ export async function fetchComexData(
   flowUi: TradeFlowUi
 ): Promise<MonthlyComexStatRecord[]>;
 export async function fetchComexData(ncm: string, a: any, b: any): Promise<any[]> {
-  // (ncm, year:number, flowUi)
   if (typeof a === "number" && (b === "import" || b === "export")) {
     return await fetchComexDataByNcm(ncm, a, b);
   }
-
-  // (ncm, period: {from,to}, flowUi)
-  if (a && typeof a === "object" && typeof a.from === "string" && typeof a.to === "string" && (b === "import" || b === "export")) {
+  if (
+    a &&
+    typeof a === "object" &&
+    typeof a.from === "string" &&
+    typeof a.to === "string" &&
+    (b === "import" || b === "export")
+  ) {
     return await fetchComexDataByNcmPeriod(ncm, a as Period, b as TradeFlowUi);
   }
-
-  // fallback defensivo
   console.warn("[comexApiService] fetchComexData chamado com assinatura inesperada:", { ncm, a, b });
   return [];
+}
+
+/**
+ * ✅ COMPAT LEGADA: App.tsx importa "fetchLastUpdateData"
+ */
+export async function fetchLastUpdateData(): Promise<LastUpdateData> {
+  return await fetchLastUpdate();
 }
