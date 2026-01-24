@@ -17,7 +17,7 @@ export interface LastUpdateData {
 
 export interface Period {
   from: string; // "YYYY-MM"
-  to: string;   // "YYYY-MM"
+  to: string; // "YYYY-MM"
 }
 
 export interface ApiFilter {
@@ -47,39 +47,31 @@ const PROD = import.meta.env.PROD;
 // Em desenvolvimento (local): mantemos chamada direta para continuar funcionando no npm run dev.
 const BASE_URLS = PROD
   ? [
+      // ✅ Em produção: SOMENTE via proxy Netlify (evita 451/CORS/Mixed Content no browser)
       "/api/comex/general?filter=",
-      // fallback (caso o proxy esteja indisponível)
-      "https://api-comexstat.mdic.gov.br/general?filter=",
     ]
   : [
+      // ✅ Em desenvolvimento local: chamadas diretas continuam funcionando no npm run dev
       "https://api-comexstat.mdic.gov.br/general?filter=",
       "http://api-comexstat.mdic.gov.br/general?filter=",
       "https://api.comexstat.mdic.gov.br/general?filter=",
     ];
 
-
 // Endpoint de atualização mudou na API nova. Mantemos múltiplas tentativas.
 const LAST_UPDATE_ENDPOINTS = PROD
   ? [
-      // via proxy (produção)
+      // ✅ Em produção: SOMENTE via proxy Netlify
       "/api/comex/general/dates/updated",
-
-      // fallbacks diretos
-      "https://api-comexstat.mdic.gov.br/general/dates/updated",
-      "https://api.comexstat.mdic.gov.br/general/lastUpdate",
-      "https://api.comexstat.mdic.gov.br/general/lastupdate",
-      "https://api.comexstat.mdic.gov.br/general/last-update",
     ]
   : [
-      // API nova (local)
+      // ✅ API nova (local)
       "https://api-comexstat.mdic.gov.br/general/dates/updated",
 
-      // API legada / variações
+      // ✅ API legada / variações
       "https://api.comexstat.mdic.gov.br/general/lastUpdate",
       "https://api.comexstat.mdic.gov.br/general/lastupdate",
       "https://api.comexstat.mdic.gov.br/general/last-update",
     ];
-
 
 // ===== HELPERS =====
 
@@ -100,228 +92,105 @@ function parseYearMonth(s: string): { year: number; month: number } | null {
   return { year, month };
 }
 
-function periodToYears(period: Period): { yearStart: number; yearEnd: number; monthStart: string; monthEnd: string } {
-  const from = parseYearMonth(period.from);
-  const to = parseYearMonth(period.to);
-  const now = new Date();
-  const fallback = { year: now.getFullYear(), month: now.getMonth() + 1 };
-
-  const f = from ?? fallback;
-  const t = to ?? fallback;
-
-  return {
-    yearStart: f.year,
-    yearEnd: t.year,
-    monthStart: String(f.month).padStart(2, "0"),
-    monthEnd: String(t.month).padStart(2, "0"),
-  };
+function periodToYM(period: Period): { yearStart: number; monthStart: number; yearEnd: number; monthEnd: number } {
+  const f = parseYearMonth(period.from);
+  const t = parseYearMonth(period.to);
+  if (!f || !t) {
+    // fallback defensivo
+    const now = new Date();
+    const year = now.getFullYear();
+    const month = now.getMonth() + 1;
+    return { yearStart: year, monthStart: 1, yearEnd: year, monthEnd: month };
+  }
+  return { yearStart: f.year, monthStart: f.month, yearEnd: t.year, monthEnd: t.month };
 }
 
-function buildMetricsFlags(metrics: string[]) {
-  const set = new Set(metrics || []);
-  return {
-    metricFOB: set.has("metricFOB"),
-    metricKG: set.has("metricKG"),
-    metricStatistic: set.has("metricStatistic"),
-    metricCIF: set.has("metricCIF"),
-    metricFreight: set.has("metricFreight"),
-    metricInsurance: set.has("metricInsurance"),
-  };
+function normalizeNcmLoose(ncm: string): string {
+  const only = String(ncm || "").replace(/\D/g, "");
+  if (only.length === 0) return "";
+  // não força 8; mantém como vem (muitas telas usam 6/8)
+  return only;
 }
 
-function normalizeNcmDigits(raw: unknown): string {
-  return String(raw ?? "").replace(/\D/g, "");
-}
-
-// ✅ Para CGIM: NCM canônica de 8 dígitos ou null
-export function normalizeNcmTo8(raw: unknown): string | null {
-  const digits = normalizeNcmDigits(raw);
-  if (digits.length !== 8) return null;
-  return digits;
-}
-
-// Para App: não forçamos 8, pois ele pode aceitar hierarquia; mas em geral o usuário usa 8
-function normalizeNcmLoose(raw: unknown): string {
-  return normalizeNcmDigits(raw);
-}
-
-async function fetchWithTimeout(url: string, timeoutMs: number): Promise<Response> {
+function fetchWithTimeout(url: string, ms = 20_000, init?: RequestInit): Promise<Response> {
   const controller = new AbortController();
-  const t = setTimeout(() => controller.abort(), timeoutMs);
+  const id = setTimeout(() => controller.abort(), ms);
+  return fetch(url, { ...(init || {}), signal: controller.signal }).finally(() => clearTimeout(id));
+}
+
+async function tryFetchJson(url: string, ms = 25_000): Promise<any> {
+  const res = await fetchWithTimeout(url, ms);
+  const ct = res.headers.get("content-type") || "";
+  const isJson = ct.includes("application/json") || ct.includes("text/json");
+  const text = await res.text();
+  if (!res.ok) {
+    // tenta extrair msg
+    let msg = text;
+    try {
+      if (isJson) {
+        const j = JSON.parse(text);
+        msg = j?.message || j?.error || text;
+      }
+    } catch {
+      // ignore
+    }
+    throw new Error(`HTTP ${res.status} - ${msg}`);
+  }
+  if (isJson) {
+    try {
+      return JSON.parse(text);
+    } catch {
+      // fallback para retorno não-JSON
+      return text;
+    }
+  }
+  // às vezes a API devolve JSON com content-type errado
   try {
-    return await fetch(url, { signal: controller.signal });
-  } finally {
-    clearTimeout(t);
+    return JSON.parse(text);
+  } catch {
+    return text;
   }
 }
 
-/**
- * Extrai as linhas do retorno do Comex Stat.
- *
- * A API antiga (legada) retornava um array "cru" no formato: [[rows], meta...]
- * A API nova (api-comexstat) retorna um envelope: { data: { list: [...] }, success: true, ... }
- *   e/ou algumas variações: { data: [[rows], ...], ... }
- *
- * Se este parser falhar, o CGIM zera tudo (porque acha que "não veio nada").
- */
-function extractRows(json: any): any[] {
-  // ✅ Formato comum na API nova: { data: { list: [...] } }
-  const list =
-    json?.data?.list ??
-    json?.Data?.list ??
-    json?.result?.list ??
-    json?.resultado?.list;
-
-  // ✅ (AJUSTE) Às vezes o "list" vem como array legado dentro (list[0][0])
-  if (Array.isArray(list)) {
-    // list pode ser: [ [rows], meta ]  OU  rows direto
-    const maybe = list?.[0]?.[0];
-    if (Array.isArray(maybe)) return maybe;
-
-    const maybe2 = list?.[0];
-    if (Array.isArray(maybe2) && (maybe2.length === 0 || typeof maybe2[0] === "object")) return maybe2;
-
-    if (list.length === 0) return list;
-    if (list.length > 0 && typeof list[0] === "object" && !Array.isArray(list[0])) return list;
-  }
-
-  // --- Helper para navegar em formatos possíveis ---
-  const tryArrayShape = (root: any): any[] => {
-    if (!Array.isArray(root)) return [];
-
-    // formato mais comum nos serviços legados: root[0][0] = rows
-    const a = root?.[0]?.[0];
-    if (Array.isArray(a)) return a;
-
-    // às vezes vem root[0] = rows
-    const b = root?.[0];
-    if (Array.isArray(b) && (b.length === 0 || typeof b[0] === "object")) return b;
-
-    // às vezes já vem array de objetos direto
-    if (root.length === 0) return root;
-    if (root.length > 0 && typeof root[0] === "object" && !Array.isArray(root[0])) return root;
-
-    return [];
-  };
-
-  // 1) formato antigo (array raiz)
-  const fromArrayRoot = tryArrayShape(json);
-  if (fromArrayRoot.length) return fromArrayRoot;
-
-  // 2) formato novo (envelope com data como array)
-  const data = json?.data ?? json?.Data ?? json?.result ?? json?.resultado;
-  const fromData = tryArrayShape(data);
-  if (fromData.length) return fromData;
-
-  // ✅ (AJUSTE) alguns endpoints aninham data.data
-  const data2 = data?.data ?? data?.Data ?? data?.result ?? data?.resultado;
-  const fromData2 = tryArrayShape(data2);
-  if (fromData2.length) return fromData2;
-
-  // 3) alguns endpoints podem aninhar mais um nível
-  const deep = json?.data?.data ?? json?.data?.rows ?? json?.rows;
-  const fromDeep = tryArrayShape(deep);
-  if (fromDeep.length) return fromDeep;
-
-  // ✅ (AJUSTE) variações: data.list dentro de data.data
-  const deepList = json?.data?.data?.list ?? json?.data?.result?.list ?? json?.data?.resultado?.list;
-  const fromDeepList = tryArrayShape(deepList);
-  if (fromDeepList.length) return fromDeepList;
-
-  return [];
-}
-
-function coerceNumber(v: any): number {
-  const n = Number(v);
+function safeNumber(x: any): number {
+  const n = Number(x);
   return Number.isFinite(n) ? n : 0;
 }
 
-function parseGeneralResponseToValue(json: any): NcmYearValue {
-  const rows = extractRows(json);
-  if (!rows.length) return { fob: 0, kg: 0 };
-  const row = rows[0];
+// ===== API CALLS =====
 
-  // ✅ API nova muitas vezes usa metricFOB/metricKG
-  const fob = coerceNumber(
-    row?.metricFOB ??
-      row?.vlFob ??
-      row?.vl_fob ??
-      row?.fob ??
-      row?.valorFOB ??
-      row?.vlFOB
-  );
-
-  const kg = coerceNumber(
-    row?.metricKG ??
-      row?.kgLiquido ??
-      row?.kg_liquido ??
-      row?.kg ??
-      row?.pesoLiquido ??
-      row?.kgLiqu
-  );
-
-  return { fob, kg };
-}
-
-async function comexGeneralRequest(payload: any, timeoutMs = 45_000): Promise<any[]> {
-  const filter = encodeURIComponent(JSON.stringify(payload));
-  let lastErr: any = null;
-
-  for (const base of BASE_URLS) {
-    const url = `${base}${filter}`;
-    try {
-      const res = await fetchWithTimeout(url, timeoutMs);
-      if (!res.ok) {
-        lastErr = new Error(`ComexStat HTTP ${res.status}`);
-        continue;
-      }
-      const json = await res.json();
-      return extractRows(json);
-    } catch (e) {
-      lastErr = e;
-    }
-  }
-
-  console.warn("[comexApiService] Falha ao consultar ComexStat. Retornando lista vazia.", lastErr);
-  return [];
-}
-
-function mapFiltersToComex(filterList: any[], filterArray: any[], detailDatabase: any[], filters: ApiFilter[]) {
-  for (const f of filters || []) {
-    if (f.filter === "ncm") {
-      const items = (f.values || []).map(normalizeNcmLoose).filter(Boolean);
-      filterList.push({ id: "noNcmpt" });
-      filterArray.push({ item: items, idInput: "noNcmpt" });
-      detailDatabase.push({ id: "noNcmpt", text: "" });
-    }
-  }
-}
-
-// ===== EXPORTS DO APP =====
-
-export async function fetchLastUpdateData(): Promise<LastUpdateData> {
+export async function fetchLastUpdate(): Promise<LastUpdateData> {
   for (const url of LAST_UPDATE_ENDPOINTS) {
     try {
-      const res = await fetchWithTimeout(url, 15_000);
-      if (!res.ok) continue;
-      const json = await res.json();
-      if (json && Number.isFinite(json.year) && Number.isFinite(json.month)) {
-        return { year: Number(json.year), month: Number(json.month) };
-      }
-      // API nova costuma vir envelopada em { data, success, ... }
-      const data = json?.data ?? json;
+      const json = await tryFetchJson(url, 20_000);
 
-      if (data && Number.isFinite(data.ano) && Number.isFinite(data.mes)) {
-        return { year: Number(data.ano), month: Number(data.mes) };
+      // Formatos possíveis:
+      // - API nova: { year, month } OU { data: { year, month } }
+      // - API legada: { lastUpdate: "YYYY-MM" } etc.
+      const directYear = Number(json?.year ?? json?.data?.year);
+      const directMonth = Number(json?.month ?? json?.data?.month);
+      if (Number.isFinite(directYear) && Number.isFinite(directMonth)) {
+        return { year: directYear, month: directMonth };
       }
 
-      // fallback: se vier uma data (updatedAt / updated_at), converte
-      const updatedAt = data?.updatedAt ?? data?.updated_at ?? data?.dataAtualizacao ?? data?.lastUpdate;
-      if (typeof updatedAt === "string" && updatedAt) {
-        const d = new Date(updatedAt);
-        if (!Number.isNaN(d.getTime())) {
-          return { year: d.getFullYear(), month: d.getMonth() + 1 };
-        }
+      const s =
+        json?.lastUpdate ??
+        json?.lastupdate ??
+        json?.last_update ??
+        json?.data?.lastUpdate ??
+        json?.data?.lastupdate ??
+        json?.data?.last_update;
+
+      if (typeof s === "string") {
+        const ym = parseYearMonth(s);
+        if (ym) return { year: ym.year, month: ym.month };
+      }
+
+      // tentativa de achar no payload
+      const maybe = json?.data;
+      if (typeof maybe === "string") {
+        const ym = parseYearMonth(maybe);
+        if (ym) return { year: ym.year, month: ym.month };
       }
     } catch {
       // segue
@@ -335,11 +204,19 @@ export async function fetchNcmDescription(ncm: string): Promise<string> {
   const n = normalizeNcmLoose(ncm);
   if (!n) return "";
 
-  const candidates = [
-    `https://api.comexstat.mdic.gov.br/tables/ncm/${n}`,
-    `https://api.comexstat.mdic.gov.br/tables/ncm?code=${n}`,
-    `https://api.comexstat.mdic.gov.br/tables/ncm?noNcm=${n}`,
-  ];
+  const candidates = PROD
+    ? [
+        // ✅ Em produção: via proxy Netlify (evita 451/CORS)
+        `/api/comex/tables/ncm/${n}`,
+        `/api/comex/tables/ncm?code=${n}`,
+        `/api/comex/tables/ncm?noNcm=${n}`,
+      ]
+    : [
+        // ✅ Em desenvolvimento: direto (funciona no npm run dev)
+        `https://api.comexstat.mdic.gov.br/tables/ncm/${n}`,
+        `https://api.comexstat.mdic.gov.br/tables/ncm?code=${n}`,
+        `https://api.comexstat.mdic.gov.br/tables/ncm?noNcm=${n}`,
+      ];
 
   for (const url of candidates) {
     try {
@@ -365,11 +242,19 @@ export async function fetchNcmUnit(ncm: string): Promise<string> {
   const n = normalizeNcmLoose(ncm);
   if (!n) return "";
 
-  const candidates = [
-    `https://api.comexstat.mdic.gov.br/tables/ncm/${n}`,
-    `https://api.comexstat.mdic.gov.br/tables/ncm?code=${n}`,
-    `https://api.comexstat.mdic.gov.br/tables/ncm?noNcm=${n}`,
-  ];
+  const candidates = PROD
+    ? [
+        // ✅ Em produção: via proxy Netlify (evita 451/CORS)
+        `/api/comex/tables/ncm/${n}`,
+        `/api/comex/tables/ncm?code=${n}`,
+        `/api/comex/tables/ncm?noNcm=${n}`,
+      ]
+    : [
+        // ✅ Em desenvolvimento: direto (funciona no npm run dev)
+        `https://api.comexstat.mdic.gov.br/tables/ncm/${n}`,
+        `https://api.comexstat.mdic.gov.br/tables/ncm?code=${n}`,
+        `https://api.comexstat.mdic.gov.br/tables/ncm?noNcm=${n}`,
+      ];
 
   for (const url of candidates) {
     try {
@@ -379,10 +264,10 @@ export async function fetchNcmUnit(ncm: string): Promise<string> {
       const unit =
         json?.unit ??
         json?.unidade ??
-        json?.noUnid ??
+        json?.noUnit ??
         json?.data?.unit ??
         json?.data?.unidade ??
-        json?.data?.noUnid;
+        json?.data?.noUnit;
       if (typeof unit === "string") return unit;
     } catch {
       // segue
@@ -391,269 +276,201 @@ export async function fetchNcmUnit(ncm: string): Promise<string> {
   return "";
 }
 
-export async function fetchComexData(
-  flow: TradeFlowUi,
-  period: Period,
-  filters: ApiFilter[],
-  metrics: string[],
-  groupBy: string[] = []
-): Promise<ComexStatRecord[]> {
-  const { yearStart, yearEnd, monthStart, monthEnd } = periodToYears(period);
-  const metricFlags = buildMetricsFlags(metrics);
+// ===============================
+// ✅ Função base: chama /general?filter=...
+// ===============================
+async function comexGeneralRequest(filterObj: any): Promise<any[]> {
+  const filter = encodeURIComponent(JSON.stringify(filterObj));
+  let lastErr: any = null;
 
-  const detailDatabase: any[] = [];
-  const filterList: any[] = [];
-  const filterArray: any[] = [];
-
-  mapFiltersToComex(filterList, filterArray, detailDatabase, filters);
-
-  const wantsNcmDetail = (groupBy || []).includes("ncm");
-  if (wantsNcmDetail) {
-    if (!detailDatabase.some((d) => d.id === "noNcmpt")) {
-      detailDatabase.push({ id: "noNcmpt", text: "" });
+  for (const base of BASE_URLS) {
+    const url = `${base}${filter}`;
+    try {
+      const json = await tryFetchJson(url, 35_000);
+      // API costuma devolver { data: [...] } ou direto [...]
+      const data = Array.isArray(json) ? json : json?.data;
+      if (Array.isArray(data)) return data;
+      // fallback: se veio algo inesperado
+      return [];
+    } catch (err: any) {
+      lastErr = err;
+      // tenta próximo base
     }
   }
 
-  const payload = {
-    yearStart: String(yearStart),
-    yearEnd: String(yearEnd),
-    typeForm: toApiTypeFormFromUi(flow),
-    typeOrder: 1,
-    filterList,
-    filterArray,
-    detailDatabase,
-    monthDetail: false,
-    ...metricFlags,
-    monthStart,
-    monthEnd,
-    formQueue: "general",
-    langDefault: "pt",
-  };
-
-  return await comexGeneralRequest(payload);
-}
-
-export async function fetchMonthlyComexData(
-  flow: TradeFlowUi,
-  period: Period,
-  filters: ApiFilter[],
-  metrics: string[]
-): Promise<MonthlyComexStatRecord[]> {
-  const { yearStart, yearEnd, monthStart, monthEnd } = periodToYears(period);
-  const metricFlags = buildMetricsFlags(metrics);
-
-  const detailDatabase: any[] = [];
-  const filterList: any[] = [];
-  const filterArray: any[] = [];
-
-  mapFiltersToComex(filterList, filterArray, detailDatabase, filters);
-
-  const payload = {
-    yearStart: String(yearStart),
-    yearEnd: String(yearEnd),
-    typeForm: toApiTypeFormFromUi(flow),
-    typeOrder: 1,
-    filterList,
-    filterArray,
-    detailDatabase,
-    monthDetail: true,
-    ...metricFlags,
-    monthStart,
-    monthEnd,
-    formQueue: "general",
-    langDefault: "pt",
-  };
-
-  return await comexGeneralRequest(payload);
-}
-
-export async function fetchCountryData(
-  ncm: string,
-  flow: TradeFlowUi,
-  year: number
-): Promise<CountryDataRecord[]> {
-  const n = normalizeNcmLoose(ncm);
-  if (!n || !Number.isFinite(year)) return [];
-
-  const countryDetailIds = ["noPais", "noPaisOrigem", "noPaisDestino", "coPais", "coPaisOrigem", "coPaisDestino"];
-
-  for (const countryId of countryDetailIds) {
-    const payload = {
-      yearStart: String(year),
-      yearEnd: String(year),
-      typeForm: toApiTypeFormFromUi(flow),
-      typeOrder: 1,
-      filterList: [{ id: "noNcmpt" }],
-      filterArray: [{ item: [n], idInput: "noNcmpt" }],
-      detailDatabase: [{ id: countryId, text: "" }],
-      monthDetail: false,
-      metricFOB: true,
-      metricKG: true,
-      metricStatistic: false,
-      monthStart: "01",
-      monthEnd: "12",
-      formQueue: "general",
-      langDefault: "pt",
-    };
-
-    const rows = await comexGeneralRequest(payload);
-    if (rows.length === 0) continue;
-
-    const totalFOB =
-      rows.reduce((acc: number, r: any) => acc + Number(r?.metricFOB ?? r?.vlFob ?? r?.vl_fob ?? r?.fob ?? 0), 0) || 0;
-    const totalKG =
-      rows.reduce((acc: number, r: any) => acc + Number(r?.metricKG ?? r?.kgLiquido ?? r?.kg_liquido ?? r?.kg ?? 0), 0) || 0;
-
-    const out: CountryDataRecord[] = rows
-      .map((r: any) => {
-        const fob = Number(r?.metricFOB ?? r?.vlFob ?? r?.vl_fob ?? r?.fob ?? 0) || 0;
-        const kg = Number(r?.metricKG ?? r?.kgLiquido ?? r?.kg_liquido ?? r?.kg ?? 0) || 0;
-
-        const countryName =
-          String(r?.noPais ?? r?.no_pais ?? r?.pais ?? r?.country ?? r?.noPaispt ?? r?.noPaisEn ?? "").trim() ||
-          String(r?.coPais ?? r?.co_pais ?? "").trim() ||
-          "—";
-
-        return {
-          country: countryName,
-          metricFOB: fob,
-          metricKG: kg,
-          representatividadeFOB: totalFOB > 0 ? (fob / totalFOB) * 100 : 0,
-          representatividadeKG: totalKG > 0 ? (kg / totalKG) * 100 : 0,
-        };
-      })
-      .sort((a, b) => (b.metricFOB || 0) - (a.metricFOB || 0));
-
-    return out;
-  }
-
+  // erro final
+  console.warn("[comexApiService] Falha ao consultar ComexStat. Retornando lista vazia. Error:", lastErr);
   return [];
 }
 
-// ===== EXPORT EXTRA PARA O CGIM =====
+// ===============================
+// ✅ EXPORTS LEGADOS USADOS PELO APP
+// ===============================
 
-/**
- * ✅ Export que o CGIM precisa (cgimBasketComexService.ts):
- * Busca FOB/KG de uma NCM (8 dígitos) em um ano.
- */
-export async function fetchComexYearByNcm(args: {
-  flow: TradeFlow; // "imp" | "exp"
-  ncm: string;     // 8 dígitos
-  year: number;
-}): Promise<NcmYearValue> {
-  const ncm8 = normalizeNcmTo8(args.ncm);
-  if (!ncm8 || !Number.isFinite(args.year)) return { fob: 0, kg: 0 };
+export async function fetchComexDataByNcm(
+  ncm: string,
+  year: number,
+  flowUi: TradeFlowUi
+): Promise<ComexStatRecord[]> {
+  const n = normalizeNcmLoose(ncm);
+  const typeForm = toApiTypeFormFromUi(flowUi);
 
-  const payload = {
-    yearStart: String(args.year),
-    yearEnd: String(args.year),
-    typeForm: toApiTypeForm(args.flow),
-    typeOrder: 1,
-    filterList: [{ id: "noNcmpt" }],
-    filterArray: [{ item: [ncm8], idInput: "noNcmpt" }],
-    detailDatabase: [{ id: "noNcmpt", text: "" }],
-    monthDetail: false,
-    metricFOB: true,
-    metricKG: true,
-    metricStatistic: false,
-    monthStart: "01",
-    monthEnd: "12",
-    formQueue: "general",
-    langDefault: "pt",
-  };
-
-  const filter = encodeURIComponent(JSON.stringify(payload));
-
-  let lastErr: any = null;
-  for (const base of BASE_URLS) {
-    try {
-      const res = await fetchWithTimeout(`${base}${filter}`, 45_000);
-      if (!res.ok) {
-        lastErr = new Error(`ComexStat HTTP ${res.status}`);
-        continue;
-      }
-      const json = await res.json();
-      return parseGeneralResponseToValue(json);
-    } catch (e) {
-      lastErr = e;
-    }
-  }
-
-  console.warn("[fetchComexYearByNcm] Falha ao consultar ComexStat. Retornando 0.", lastErr);
-  return { fob: 0, kg: 0 };
-}
-
-/**
- * ✅ NOVO (CGIM em lote): busca FOB/KG para UMA LISTA de NCMs em UMA chamada por lote.
- *
- * Por que isso existe?
- * - No CGIM, consultar NCM por NCM (200+ chamadas) costuma estourar timeout / rate limit.
- * - O ComexStat aceita enviar várias NCMs no mesmo payload (filterArray.item = [...]).
- *
- * Retorna uma linha por NCM encontrada. Quem chamar deve completar faltantes com 0.
- */
-export async function fetchComexYearByNcmList(args: {
-  flow: TradeFlow | TradeFlowUi; // aceita "imp|exp" ou "import|export"
-  year: number;
-  ncms: string[];
-}): Promise<NcmYearRow[]> {
-  const year = Number(args.year);
-
-  const ncms8 = (args.ncms ?? [])
-    .map((n) => normalizeNcmTo8(n))
-    .filter((x): x is string => Boolean(x));
-
-  if (!Number.isFinite(year) || !ncms8.length) return [];
-
-  // normaliza fluxo ("export" -> "exp")
-  const flow: TradeFlow =
-    args.flow === "export" ? "exp" : args.flow === "import" ? "imp" : (args.flow as TradeFlow);
-
-  const payload = {
+  const filterObj = {
     yearStart: String(year),
     yearEnd: String(year),
-    typeForm: toApiTypeForm(flow),
+    typeForm,
     typeOrder: 1,
-    filterList: [{ id: "noNcmpt" }],
-    filterArray: [{ item: ncms8, idInput: "noNcmpt" }],
-    // ✅ força o retorno por NCM
-    detailDatabase: [{ id: "noNcmpt", text: "" }],
+    filterList: [{ id: "noNcm", filterArray: [n], detailDatabase: [{ id: "noNcmpt", text: "" }] }],
     monthDetail: false,
     metricFOB: true,
     metricKG: true,
     metricStatistic: false,
+    metricCIF: false,
+    metricFreight: false,
+    metricInsurance: false,
     monthStart: "01",
     monthEnd: "12",
     formQueue: "general",
     langDefault: "pt",
   };
 
-  // ✅ Reusa o pipeline resiliente (BASE_URLS + timeout) do seu próprio serviço
-  const rows = await comexGeneralRequest(payload);
+  return (await comexGeneralRequest(filterObj)) as ComexStatRecord[];
+}
 
-  const out: NcmYearRow[] = [];
-  for (const r of rows ?? []) {
-    // ✅ Na API nova, o NCM pode vir em details.* ou em campos diretos
-    const rawNcm =
-      r?.noNcmpt ??
-      r?.noNcm ??
-      r?.coNcm ??
-      r?.co_ncm ??
-      r?.ncm ??
-      r?.details?.noNcmpt ??
-      r?.details?.noNcm ??
-      r?.details?.coNcm ??
-      r?.details?.co_ncm ??
-      r?.details?.ncm;
+export async function fetchComexDataByNcmPeriod(
+  ncm: string,
+  period: Period,
+  flowUi: TradeFlowUi
+): Promise<MonthlyComexStatRecord[]> {
+  const n = normalizeNcmLoose(ncm);
+  const typeForm = toApiTypeFormFromUi(flowUi);
+  const ym = periodToYM(period);
 
-    const ncm = normalizeNcmTo8(rawNcm);
+  const filterObj = {
+    yearStart: String(ym.yearStart),
+    yearEnd: String(ym.yearEnd),
+    typeForm,
+    typeOrder: 1,
+    filterList: [{ id: "noNcm", filterArray: [n], detailDatabase: [{ id: "noNcmpt", text: "" }] }],
+    monthDetail: true,
+    metricFOB: true,
+    metricKG: true,
+    metricStatistic: false,
+    metricCIF: false,
+    metricFreight: false,
+    metricInsurance: false,
+    monthStart: String(ym.monthStart).padStart(2, "0"),
+    monthEnd: String(ym.monthEnd).padStart(2, "0"),
+    formQueue: "general",
+    langDefault: "pt",
+  };
+
+  return (await comexGeneralRequest(filterObj)) as MonthlyComexStatRecord[];
+}
+
+export async function fetchComexCountryDataByNcm(
+  ncm: string,
+  year: number,
+  flowUi: TradeFlowUi
+): Promise<CountryDataRecord[]> {
+  const n = normalizeNcmLoose(ncm);
+  const typeForm = toApiTypeFormFromUi(flowUi);
+
+  // Para país: muda o detailDatabase e/ou filtros conforme API.
+  // Mantemos o comportamento anterior: pedir por "noCountry" se necessário.
+  const filterObj = {
+    yearStart: String(year),
+    yearEnd: String(year),
+    typeForm,
+    typeOrder: 1,
+    filterList: [
+      {
+        id: "noNcm",
+        filterArray: [n],
+        detailDatabase: [{ id: "noNcmpt", text: "" }],
+      },
+      {
+        id: "noCountry",
+        filterArray: [],
+        detailDatabase: [{ id: "noCountry", text: "" }],
+      },
+    ],
+    monthDetail: false,
+    metricFOB: true,
+    metricKG: true,
+    metricStatistic: false,
+    metricCIF: false,
+    metricFreight: false,
+    metricInsurance: false,
+    monthStart: "01",
+    monthEnd: "12",
+    formQueue: "general",
+    langDefault: "pt",
+  };
+
+  const data = await comexGeneralRequest(filterObj);
+  return (data || []).map((r: any) => ({
+    country: String(r?.noCountry ?? r?.country ?? r?.noCountrypt ?? r?.noCountryPt ?? ""),
+    metricFOB: safeNumber(r?.metricFOB ?? r?.fob ?? r?.vlFob ?? r?.valueFOB),
+    metricKG: safeNumber(r?.metricKG ?? r?.kg ?? r?.vlKg ?? r?.valueKG),
+  }));
+}
+
+// ===============================
+// ✅ EXPORT EXTRA para CGIM: (batch anual por NCM)
+// ===============================
+export async function fetchComexYearByNcm(
+  ncms: string[],
+  year: number,
+  flow: TradeFlow
+): Promise<NcmYearValue[]> {
+  const list = (ncms || []).map(normalizeNcmLoose).filter(Boolean);
+  if (!list.length) return [];
+
+  const typeForm = toApiTypeForm(flow);
+
+  const filterObj = {
+    yearStart: String(year),
+    yearEnd: String(year),
+    typeForm,
+    typeOrder: 1,
+    filterList: [
+      {
+        id: "noNcm",
+        filterArray: list,
+        detailDatabase: [{ id: "noNcmpt", text: "" }],
+      },
+    ],
+    // anual (sem mês)
+    monthDetail: false,
+    // métricas principais do CGIM
+    metricFOB: true,
+    metricKG: true,
+    // outros desligados
+    metricStatistic: false,
+    metricCIF: false,
+    metricFreight: false,
+    metricInsurance: false,
+    monthStart: "01",
+    monthEnd: "12",
+    formQueue: "general",
+    langDefault: "pt",
+  };
+
+  const rows = (await comexGeneralRequest(filterObj)) as any[];
+
+  // Normaliza retorno para { ncm, fob, kg }
+  const map = new Map<string, NcmYearValue>();
+  for (const r of rows || []) {
+    const ncm = normalizeNcmLoose(r?.noNcm ?? r?.ncm ?? r?.code ?? "");
     if (!ncm) continue;
 
-    const fob = Number(r?.metricFOB ?? r?.vlFob ?? r?.vl_fob ?? r?.fob ?? 0) || 0;
-    const kg = Number(r?.metricKG ?? r?.kgLiquido ?? r?.kg_liquido ?? r?.kg ?? 0) || 0;
+    const fob = safeNumber(r?.metricFOB ?? r?.fob ?? r?.vlFob ?? r?.valueFOB);
+    const kg = safeNumber(r?.metricKG ?? r?.kg ?? r?.vlKg ?? r?.valueKG);
 
-    out.push({ ncm, fob, kg });
+    map.set(ncm, { ncm, fob, kg });
   }
 
-  return out;
+  // garante todos (inclusive zeros)
+  return list.map((n) => map.get(n) || { ncm: n, fob: 0, kg: 0 });
 }
