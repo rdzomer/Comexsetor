@@ -1,5 +1,5 @@
 // services/comexApiService.ts
-// ✅ CONTRATO LEGADO do App.tsx + ✅ exports CGIM (inclui fetchComexYearByNcmList + fetchComexData compat + fetchLastUpdateData compat)
+// ✅ CONTRATO LEGADO do App.tsx + ✅ exports CGIM (inclui compat: fetchComexYearByNcmList, fetchComexData, fetchLastUpdateData, fetchMonthlyComexData, fetchCountryData)
 
 import type { NcmYearValue } from "../utils/cgimTypes";
 
@@ -149,6 +149,10 @@ function safeNumber(x: any): number {
   return Number.isFinite(n) ? n : 0;
 }
 
+function pad2(n: number): string {
+  return String(n).padStart(2, "0");
+}
+
 // ===== API CALLS =====
 
 export async function fetchLastUpdate(): Promise<LastUpdateData> {
@@ -276,7 +280,7 @@ async function comexGeneralRequest(filterObj: any): Promise<any[]> {
 }
 
 // ===============================
-// ✅ EXPORTS LEGADOS USADOS PELO APP
+// ✅ EXPORTS “CORE”
 // ===============================
 
 export async function fetchComexDataByNcm(ncm: string, year: number, flowUi: TradeFlowUi): Promise<ComexStatRecord[]> {
@@ -327,8 +331,8 @@ export async function fetchComexDataByNcmPeriod(
     metricCIF: false,
     metricFreight: false,
     metricInsurance: false,
-    monthStart: String(ym.monthStart).padStart(2, "0"),
-    monthEnd: String(ym.monthEnd).padStart(2, "0"),
+    monthStart: pad2(ym.monthStart),
+    monthEnd: pad2(ym.monthEnd),
     formQueue: "general",
     langDefault: "pt",
   };
@@ -444,13 +448,7 @@ export async function fetchComexData(ncm: string, a: any, b: any): Promise<any[]
   if (typeof a === "number" && (b === "import" || b === "export")) {
     return await fetchComexDataByNcm(ncm, a, b);
   }
-  if (
-    a &&
-    typeof a === "object" &&
-    typeof a.from === "string" &&
-    typeof a.to === "string" &&
-    (b === "import" || b === "export")
-  ) {
+  if (a && typeof a === "object" && typeof a.from === "string" && typeof a.to === "string" && (b === "import" || b === "export")) {
     return await fetchComexDataByNcmPeriod(ncm, a as Period, b as TradeFlowUi);
   }
   console.warn("[comexApiService] fetchComexData chamado com assinatura inesperada:", { ncm, a, b });
@@ -462,4 +460,42 @@ export async function fetchComexData(ncm: string, a: any, b: any): Promise<any[]
  */
 export async function fetchLastUpdateData(): Promise<LastUpdateData> {
   return await fetchLastUpdate();
+}
+
+/**
+ * ✅ COMPAT LEGADA: App.tsx importa "fetchMonthlyComexData"
+ * Implementação: retorna dados mensais via fetchComexDataByNcmPeriod.
+ *
+ * Suporta:
+ *  - fetchMonthlyComexData(ncm, year, flowUi)  -> (Jan..Dec daquele ano)
+ *  - fetchMonthlyComexData(ncm, period, flowUi)
+ */
+export async function fetchMonthlyComexData(
+  ncm: string,
+  year: number,
+  flowUi: TradeFlowUi
+): Promise<MonthlyComexStatRecord[]>;
+export async function fetchMonthlyComexData(
+  ncm: string,
+  period: Period,
+  flowUi: TradeFlowUi
+): Promise<MonthlyComexStatRecord[]>;
+export async function fetchMonthlyComexData(ncm: string, a: any, b: any): Promise<MonthlyComexStatRecord[]> {
+  if (typeof a === "number" && (b === "import" || b === "export")) {
+    const y = a;
+    const period: Period = { from: `${y}-01`, to: `${y}-12` };
+    return await fetchComexDataByNcmPeriod(ncm, period, b as TradeFlowUi);
+  }
+  if (a && typeof a === "object" && typeof a.from === "string" && typeof a.to === "string" && (b === "import" || b === "export")) {
+    return await fetchComexDataByNcmPeriod(ncm, a as Period, b as TradeFlowUi);
+  }
+  console.warn("[comexApiService] fetchMonthlyComexData chamado com assinatura inesperada:", { ncm, a, b });
+  return [];
+}
+
+/**
+ * ✅ COMPAT LEGADA: App.tsx importa "fetchCountryData"
+ */
+export async function fetchCountryData(ncm: string, year: number, flowUi: TradeFlowUi): Promise<CountryDataRecord[]> {
+  return await fetchComexCountryDataByNcm(ncm, year, flowUi);
 }
