@@ -1,16 +1,13 @@
 [build]
   command = "npm run build"
-  publish = "dist" # Ou "build", verifique qual pasta o Vite gera
+  publish = "dist"
 
-# Regra 1: Proxy para a API do ComexStat (Corrige o fetch de dados)
-# Ajuste o "from" se sua chamada no código for diferente de /api/*
 [[redirects]]
-  from = "/api/*"
+  from = "/api-proxy/*"
   to = "https://api-comexstat.mdic.gov.br/:splat"
   status = 200
   force = true
 
-# Regra 2: SPA Catch-all (Corrige a tela branca ao dar F5 em rotas internas)
 [[redirects]]
   from = "/*"
   to = "/index.html"

@@ -40,14 +40,29 @@ export interface CountryDataRecord {
 // ⚠️ IMPORTANTÍSSIMO:
 // A API nova usa o host com hífen: api-comexstat.mdic.gov.br
 // Mantemos também os hosts legados como fallback para não quebrar nada.
+// Encontre as BASE_URLS e substitua por estas:
 const BASE_URLS = [
-  // host atual (principal)
+  "/api-proxy/general?filter=",
   "https://api-comexstat.mdic.gov.br/general?filter=",
-  "http://api-comexstat.mdic.gov.br/general?filter=",
+  "http://api-comexstat.mdic.gov.br/general?filter="
+];
 
-  // hosts legados (fallback)
-  "https://api.comexstat.mdic.gov.br/general?filter=",
-  "http://api.comexstat.mdic.gov.br/general?filter=",
+// Encontre as LAST_UPDATE_ENDPOINTS e substitua por estas:
+const LAST_UPDATE_ENDPOINTS = [
+  "/api-proxy/general/dates/updated",
+  "https://api-comexstat.mdic.gov.br/general/dates/updated",
+  "https://api-comexstat.mdic.gov.br/general/lastUpdate"
+];
+
+const LAST_UPDATE_ENDPOINTS = [
+  // 1. Tenta pelo Proxy do Netlify
+  "/api-proxy/general/dates/updated",
+
+  // 2. Fallbacks
+  "https://api-comexstat.mdic.gov.br/general/dates/updated",
+  "https://api.comexstat.mdic.gov.br/general/lastUpdate",
+  "https://api.comexstat.mdic.gov.br/general/lastupdate",
+  "https://api.comexstat.mdic.gov.br/general/last-update",
 ];
 
 // Endpoint de atualização mudou na API nova. Mantemos múltiplas tentativas.
