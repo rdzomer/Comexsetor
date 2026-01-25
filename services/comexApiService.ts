@@ -41,7 +41,7 @@ export interface CountryDataRecord {
 // A API nova usa o host com hífen: api-comexstat.mdic.gov.br
 // Mantemos também os hosts legados como fallback para não quebrar nada.
 const BASE_URLS = [
-  "/api-proxy/general?filter=",
+  const BASE_URL = '/api-proxy/general';
   "https://api-comexstat.mdic.gov.br/general?filter=",
   "http://api-comexstat.mdic.gov.br/general?filter="
 ];
