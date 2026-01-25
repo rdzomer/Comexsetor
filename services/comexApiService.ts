@@ -328,9 +328,9 @@ function mapFiltersToComex(filterList: any[], filterArray: any[], detailDatabase
   for (const f of filters || []) {
     if (f.filter === "ncm") {
       const items = (f.values || []).map(normalizeNcmLoose).filter(Boolean);
-      filterList.push({ id: "noNcmpt" });
-      filterArray.push({ item: items, idInput: "noNcmpt" });
-      detailDatabase.push({ id: "noNcmpt", text: "" });
+      filterList.push({ id: "coNcm" });
+      filterArray.push({ item: items, idInput: "coNcm" });
+      // detailDatabase só se você realmente precisa detalhar/agrupador; senão pode ficar vazio
     }
   }
 }
@@ -529,8 +529,8 @@ export async function fetchCountryData(
       yearEnd: String(year),
       typeForm: toApiTypeFormFromUi(flow),
       typeOrder: 1,
-      filterList: [{ id: "noNcmpt" }],
-      filterArray: [{ item: [n], idInput: "noNcmpt" }],
+      filterList: [{ id: "coNcm" }],
+      filterArray: [{ item: [n], idInput: "coNcm" }],
       detailDatabase: [{ id: countryId, text: "" }],
       monthDetail: false,
       metricFOB: true,
@@ -595,8 +595,8 @@ export async function fetchComexYearByNcm(args: {
     yearEnd: String(args.year),
     typeForm: toApiTypeForm(args.flow),
     typeOrder: 1,
-    filterList: [{ id: "noNcmpt" }],
-    filterArray: [{ item: [ncm8], idInput: "noNcmpt" }],
+    filterList: [{ id: "coNcm" }],
+    filterArray: [{ item: [ncm8], idInput: "coNcm" }],
     detailDatabase: [{ id: "noNcmpt", text: "" }],
     monthDetail: false,
     metricFOB: true,
@@ -665,8 +665,8 @@ export async function fetchComexYearByNcmList(args: {
         yearEnd: String(year),
         typeForm: toApiTypeForm(flow),
         typeOrder: 1,
-        filterList: [{ id: "noNcmpt" }],
-        filterArray: [{ item: thisChunk, idInput: "noNcmpt" }],
+        filterList: [{ id: "coNcm" }],
+        filterArray: [{ item: thisChunk, idInput: "coNcm" }],
         detailDatabase: [{ id: "noNcmpt", text: "" }], // força retorno por NCM
         monthDetail: false,
         metricFOB: true,
