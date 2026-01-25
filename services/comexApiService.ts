@@ -38,9 +38,9 @@ export interface CountryDataRecord {
 
 // ===== CONFIG =====
 // ✅ API correta (Swagger / produção): POST https://api-comexstat.mdic.gov.br/general
-// ✅ Querystring tipicamente só para language (opcional).
+// ✅ Querystring tipicamente só para language (opcional). Aqui fixamos language=pt para consistência.
 // 🚫 Não usar http:// (Mixed Content) e 🚫 não usar host sem hífen (ERR_NAME_NOT_RESOLVED).
-const GENERAL_ENDPOINT = "https://api-comexstat.mdic.gov.br/general";
+const GENERAL_ENDPOINT = "https://api-comexstat.mdic.gov.br/general?language=pt";
 
 // Endpoint de atualização mudou na API nova. Mantemos múltiplas tentativas.
 const LAST_UPDATE_ENDPOINTS = [
@@ -133,6 +133,62 @@ async function fetchWithTimeout(url: string, timeoutMs: number, init?: RequestIn
   } finally {
     clearTimeout(t);
   }
+}
+
+/**
+ * ✅ Converte payload legado (do App antigo) para o body novo do /general (Swagger).
+ * Cobre o que é usado hoje: NCM e "country".
+ */
+function legacyToNewGeneralBody(p: any) {
+  const flow = Number(p?.typeForm) === 1 ? "export" : "import";
+
+  const yearStart = String(p?.yearStart ?? "");
+  const yearEnd = String(p?.yearEnd ?? "");
+  const monthStart = String(p?.monthStart ?? "01").padStart(2, "0");
+  const monthEnd = String(p?.monthEnd ?? "12").padStart(2, "0");
+
+  const period = {
+    from: `${yearStart}-${monthStart}`,
+    to: `${yearEnd}-${monthEnd}`,
+  };
+
+  // metrics
+  const metrics: string[] = [];
+  for (const k of ["metricFOB", "metricKG", "metricStatistic", "metricFreight", "metricInsurance", "metricCIF"]) {
+    if (p?.[k] === true) metrics.push(k);
+  }
+
+  // filters: hoje você só usa NCM (noNcmpt)
+  const filters: Array<{ filter: string; values: any[] }> = [];
+  const fa = Array.isArray(p?.filterArray) ? p.filterArray : [];
+  for (const f of fa) {
+    if (f?.idInput === "noNcmpt") {
+      filters.push({ filter: "ncm", values: Array.isArray(f.item) ? f.item : [] });
+    }
+  }
+
+  // details: mapear seus ids legados -> names novos
+  const details: string[] = [];
+  const dd = Array.isArray(p?.detailDatabase) ? p.detailDatabase : [];
+  for (const d of dd) {
+    const id = d?.id;
+    if (id === "noNcmpt" && !details.includes("ncm")) details.push("ncm");
+    if (
+      (id === "noPais" || id === "noPaisOrigem" || id === "noPaisDestino" || id === "coPais" || id === "coPaisOrigem" || id === "coPaisDestino") &&
+      !details.includes("country")
+    ) {
+      details.push("country");
+    }
+  }
+
+  return {
+    flow,
+    monthDetail: Boolean(p?.monthDetail),
+    period,
+    filters,
+    details: details.length ? details : ["ncm"],
+    metrics: metrics.length ? metrics : ["metricFOB", "metricKG"],
+  };
 }
 
 /**
@@ -240,32 +296,27 @@ function parseGeneralResponseToValue(json: any): NcmYearValue {
 
 // ====== ✅ NOVO CORE: /general via POST + body (Swagger) ======
 async function comexGeneralRequest(payload: any, timeoutMs = DEFAULT_TIMEOUT_MS): Promise<any[]> {
-  // ⚠️ NÃO serializa payload em querystring.
-  // ✅ POST no host correto, HTTPS, sem fallback pra http/host errado.
-  let res: Response | null = null;
-  let json: any = null;
-
   try {
-    // Se você quiser language como query, use:
-    // const url = `${GENERAL_ENDPOINT}?language=pt`;
     const url = GENERAL_ENDPOINT;
 
-    res = await fetchWithTimeout(url, timeoutMs, {
+    // ✅ Se já vier no formato novo, usa direto
+    const isNewShape = payload && typeof payload.flow === "string" && payload.period && Array.isArray(payload.metrics);
+
+    const body = isNewShape ? payload : legacyToNewGeneralBody(payload);
+
+    const res = await fetchWithTimeout(url, timeoutMs, {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-      },
-      body: JSON.stringify(payload),
+      headers: { "Content-Type": "application/json", Accept: "application/json" },
+      body: JSON.stringify(body),
     });
 
     if (!res.ok) {
-      // Mantém comportamento: retorna lista vazia, mas loga.
-      console.warn("[comexApiService] /general falhou:", res.status, res.statusText);
+      const txt = await res.text().catch(() => "");
+      console.warn("[comexApiService] /general falhou:", res.status, res.statusText, txt);
       return [];
     }
 
-    json = await res.json();
+    const json = await res.json();
     return extractRows(json);
   } catch (e) {
     console.warn("[comexApiService] Falha ao consultar /general (POST). Retornando lista vazia.", e);
@@ -559,9 +610,6 @@ export async function fetchComexYearByNcm(args: {
 
   try {
     const resRows = await comexGeneralRequest(payload);
-    // Para manter exatamente o contrato anterior (NcmYearValue):
-    // parseGeneralResponseToValue espera json completo, mas aqui temos rows.
-    // Então, reconstruímos o mínimo equivalente:
     if (!resRows.length) return { fob: 0, kg: 0 };
     const r = resRows[0];
     return {
