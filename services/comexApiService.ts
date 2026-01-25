@@ -365,42 +365,50 @@ export async function fetchNcmUnit(ncm: string): Promise<string> {
 }
 
 export async function fetchComexData(
-  flow: TradeFlowUi,
-  period: Period,
-  filters: ApiFilter[],
-  metrics: string[],
-  groupBy: string[] = []
-): Promise<ComexStatRecord[]> {
-  const { yearStart, yearEnd, monthStart, monthEnd } = periodToYears(period);
-  const metricFlags = buildMetricsFlags(metrics);
+  arg1: any,
+  arg2?: any,
+  arg3?: any,
+  arg4?: any,
+  arg5?: any
+): Promise<any[]> {
+  let flow: TradeFlowUi;
+  let period: Period;
+  let filters: ApiFilter[];
+  let metrics: string[];
+  let groupBy: string[];
 
-  const detailDatabase: any[] = [];
-  const filterList: any[] = [];
-  const filterArray: any[] = [];
-
-  mapFiltersToComex(filterList, filterArray, detailDatabase, filters);
-
-  const wantsNcmDetail = (groupBy || []).includes("ncm");
-  if (wantsNcmDetail) {
-    if (!detailDatabase.some((d) => d.id === "noNcmpt")) {
-      detailDatabase.push({ id: "noNcmpt", text: "" });
-    }
+  // Lógica para aceitar tanto (flow, period, filters...) quanto ({flow, period...})
+  if (typeof arg1 === 'object' && arg1.flow && arg1.period) {
+    // Se recebeu um objeto único (Padrão CGIM/Novo)
+    flow = arg1.flow;
+    period = arg1.period;
+    filters = arg1.filters || [];
+    metrics = arg1.metrics || ["metricFOB", "metricKG"];
+    groupBy = arg1.groupBy || [];
+  } else {
+    // Se recebeu argumentos separados (Padrão Antigo)
+    flow = arg1;
+    period = arg2;
+    filters = arg3 || [];
+    metrics = arg4 || ["metricFOB", "metricKG"];
+    groupBy = arg5 || [];
   }
 
+  // Montagem do Payload para a API
   const payload = {
-    yearStart: String(yearStart),
-    yearEnd: String(yearEnd),
-    typeForm: toApiTypeFormFromUi(flow),
+    yearStart: period.from.split("-")[0],
+    monthStart: period.from.split("-")[1],
+    yearEnd: period.to.split("-")[0],
+    monthEnd: period.to.split("-")[1],
+    typeForm: flow === "export" ? 1 : 2,
+    filterList: filters.map(f => ({ id: f.filter })),
+    filterArray: filters.map(f => ({ item: f.values, idInput: f.filter })),
+    detailDatabase: groupBy.map(g => ({ id: g })),
+    metricFOB: metrics.includes("metricFOB"),
+    metricKG: metrics.includes("metricKG"),
+    // ... manter outros campos padrão
     typeOrder: 1,
-    filterList,
-    filterArray,
-    detailDatabase,
-    monthDetail: false,
-    ...metricFlags,
-    monthStart,
-    monthEnd,
-    formQueue: "general",
-    langDefault: "pt",
+    monthDetail: groupBy.includes("month") || groupBy.includes("coMes"),
   };
 
   return await comexGeneralRequest(payload);
