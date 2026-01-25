@@ -47,7 +47,6 @@ const BASE_URLS = [
   "http://api-comexstat.mdic.gov.br/general?filter="
 ];
 
-// Encontre as LAST_UPDATE_ENDPOINTS e substitua por estas:
 const LAST_UPDATE_ENDPOINTS = [
   "/api-proxy/general/dates/updated",
   "https://api-comexstat.mdic.gov.br/general/dates/updated",
