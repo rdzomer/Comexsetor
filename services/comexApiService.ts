@@ -136,6 +136,41 @@ async function fetchWithTimeout(url: string, timeoutMs: number, init?: RequestIn
 }
 
 /**
+ * 🔧 AÇÃO MÍNIMA (auditoria):
+ * Corrige payload legado quando alguém usa "noNcmpt" como filtro (errado) passando código NCM.
+ * - noNcmpt é campo textual (descrição), não filtro de código.
+ * - para código NCM o id correto no legado é "coNcm".
+ *
+ * Isso evita 400 quando, por algum caminho, ainda sai:
+ *   filterList: [{id:"noNcmpt"}]
+ *   filterArray: [{idInput:"noNcmpt", item:["87087090"]}]
+ */
+function sanitizeLegacyNcmFilterIds(p: any) {
+  if (!p || typeof p !== "object") return p;
+
+  const fl = Array.isArray(p.filterList) ? p.filterList : null;
+  const fa = Array.isArray(p.filterArray) ? p.filterArray : null;
+  if (!fl || !fa) return p;
+
+  // detecta se "noNcmpt" está sendo usado com itens que parecem NCM (8 dígitos)
+  const hasNoNcmptAsFilter = fl.some((x: any) => x?.id === "noNcmpt") || fa.some((x: any) => x?.idInput === "noNcmpt");
+  if (!hasNoNcmptAsFilter) return p;
+
+  const looksLikeNcmCode = (v: any) => {
+    const d = normalizeNcmDigits(v);
+    return d.length === 8;
+  };
+
+  const arrayHasNcmCodes = fa.some((x: any) => Array.isArray(x?.item) && x.item.some(looksLikeNcmCode));
+  if (!arrayHasNcmCodes) return p;
+
+  // troca ids errados para o correto do legado
+  p.filterList = fl.map((x: any) => (x?.id === "noNcmpt" ? { ...x, id: "coNcm" } : x));
+  p.filterArray = fa.map((x: any) => (x?.idInput === "noNcmpt" ? { ...x, idInput: "coNcm" } : x));
+  return p;
+}
+
+/**
  * ✅ Converte payload legado (do App antigo) para o body novo do /general (Swagger).
  * Cobre o que é usado hoje: NCM e "country".
  */
@@ -158,12 +193,23 @@ function legacyToNewGeneralBody(p: any) {
     if (p?.[k] === true) metrics.push(k);
   }
 
-  // filters: hoje você só usa NCM (noNcmpt)
+  // filters: NCM (aceita legado "coNcm" e também corrige "noNcmpt" se vier errado)
   const filters: Array<{ filter: string; values: any[] }> = [];
   const fa = Array.isArray(p?.filterArray) ? p.filterArray : [];
+
   for (const f of fa) {
-    if (f?.idInput === "noNcmpt") {
+    const id = f?.idInput;
+
+    // ✅ id correto legado para código NCM
+    if (id === "coNcm") {
       filters.push({ filter: "ncm", values: Array.isArray(f.item) ? f.item : [] });
+      continue;
+    }
+
+    // 🔧 compat: alguns caminhos antigos mandam "noNcmpt" errado com código
+    if (id === "noNcmpt") {
+      filters.push({ filter: "ncm", values: Array.isArray(f.item) ? f.item : [] });
+      continue;
     }
   }
 
@@ -174,7 +220,12 @@ function legacyToNewGeneralBody(p: any) {
     const id = d?.id;
     if (id === "noNcmpt" && !details.includes("ncm")) details.push("ncm");
     if (
-      (id === "noPais" || id === "noPaisOrigem" || id === "noPaisDestino" || id === "coPais" || id === "coPaisOrigem" || id === "coPaisDestino") &&
+      (id === "noPais" ||
+        id === "noPaisOrigem" ||
+        id === "noPaisDestino" ||
+        id === "coPais" ||
+        id === "coPaisOrigem" ||
+        id === "coPaisDestino") &&
       !details.includes("country")
     ) {
       details.push("country");
@@ -299,10 +350,17 @@ async function comexGeneralRequest(payload: any, timeoutMs = DEFAULT_TIMEOUT_MS)
   try {
     const url = GENERAL_ENDPOINT;
 
-    // ✅ Se já vier no formato novo, usa direto
-    const isNewShape = payload && typeof payload.flow === "string" && payload.period && Array.isArray(payload.metrics);
+    // 🔧 AÇÃO MÍNIMA: garantir que, se vier "noNcmpt" como filtro legado, vira "coNcm"
+    const sanitized = sanitizeLegacyNcmFilterIds(payload);
 
-    const body = isNewShape ? payload : legacyToNewGeneralBody(payload);
+    // ✅ Se já vier no formato novo, usa direto
+    const isNewShape =
+      sanitized &&
+      typeof sanitized.flow === "string" &&
+      sanitized.period &&
+      Array.isArray(sanitized.metrics);
+
+    const body = isNewShape ? sanitized : legacyToNewGeneralBody(sanitized);
 
     const res = await fetchWithTimeout(url, timeoutMs, {
       method: "POST",
