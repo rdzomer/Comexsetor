@@ -50,29 +50,8 @@ const BASE_URLS = [
 const LAST_UPDATE_ENDPOINTS = [
   "/api-proxy/general/dates/updated",
   "https://api-comexstat.mdic.gov.br/general/dates/updated",
-  "https://api-comexstat.mdic.gov.br/general/lastUpdate"
-];
-
-const LAST_UPDATE_ENDPOINTS = [
-  // 1. Tenta pelo Proxy do Netlify
-  "/api-proxy/general/dates/updated",
-
-  // 2. Fallbacks
-  "https://api-comexstat.mdic.gov.br/general/dates/updated",
-  "https://api.comexstat.mdic.gov.br/general/lastUpdate",
-  "https://api.comexstat.mdic.gov.br/general/lastupdate",
-  "https://api.comexstat.mdic.gov.br/general/last-update",
-];
-
-// Endpoint de atualização mudou na API nova. Mantemos múltiplas tentativas.
-const LAST_UPDATE_ENDPOINTS = [
-  // API nova
-  "https://api-comexstat.mdic.gov.br/general/dates/updated",
-
-  // API legada / variações
-  "https://api.comexstat.mdic.gov.br/general/lastUpdate",
-  "https://api.comexstat.mdic.gov.br/general/lastupdate",
-  "https://api.comexstat.mdic.gov.br/general/last-update",
+  "https://api-comexstat.mdic.gov.br/general/lastUpdate",
+  "https://api.comexstat.mdic.gov.br/general/lastupdate"
 ];
 
 // ===== HELPERS =====
