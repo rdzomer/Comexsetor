@@ -287,7 +287,9 @@ export async function fetchAnnualBasketByNcm(args: FetchAnnualBasketByNcmArgs): 
         const v = { fob: Number(r.fob) || 0, kg: Number(r.kg) || 0 };
         got2.set(n, v);
         valuesByNcm.set(n, v);
-        if (useCache) setCached(flow, n, yearNum, v);
+        // ✅ Evita “congelar” zeros no cache quando a API falha / rate limit.
+        // (zeros reais podem existir, mas são raros; o custo de refetch é aceitável)
+        if (useCache && (v.fob !== 0 || v.kg !== 0)) setCached(flow, n, yearNum, v);
       }
 
       // 2.2) ainda faltou? tenta 1-a-1 (mais lento, mas evita zerar indevidamente)
@@ -296,7 +298,7 @@ export async function fetchAnnualBasketByNcm(args: FetchAnnualBasketByNcmArgs): 
         const v = await fetchComexYearByNcm({ flow, ncm: n, year: yearNum });
         const vv = { fob: Number(v.fob) || 0, kg: Number(v.kg) || 0 };
         valuesByNcm.set(n, vv);
-        if (useCache) setCached(flow, n, yearNum, vv);
+        if (useCache && (vv.fob !== 0 || vv.kg !== 0)) setCached(flow, n, yearNum, vv);
       }
     }
   }
@@ -318,7 +320,10 @@ export async function fetchAnnualBasketByNcm(args: FetchAnnualBasketByNcmArgs): 
       const v = { fob: Number(r.fob) || 0, kg: Number(r.kg) || 0 };
       got.set(n, v);
       valuesByNcm.set(n, v);
-      if (useCache) setCached(flow, n, yearNum, v);
+      if (useCache && (v.fob !== 0 || v.kg !== 0)) {
+        // ✅ evita “congelar” zeros no cache quando a API falha / rate limit
+        setCached(flow, n, yearNum, v);
+      }
     }
 
     // completa faltantes do lote:
@@ -330,7 +335,10 @@ export async function fetchAnnualBasketByNcm(args: FetchAnnualBasketByNcmArgs): 
         const v = await fetchComexYearByNcm({ flow, ncm: n, year: yearNum });
         const vv = { fob: Number(v.fob) || 0, kg: Number(v.kg) || 0 };
         valuesByNcm.set(n, vv);
-        if (useCache) setCached(flow, n, yearNum, vv);
+        if (useCache && (vv.fob !== 0 || vv.kg !== 0)) {
+          // ✅ evita “congelar” zeros no cache quando a API falha / rate limit
+          setCached(flow, n, yearNum, vv);
+        }
         done++;
         tick();
       }

@@ -75,23 +75,6 @@ function truncateLabel(s: string, max = 70) {
   return t.length > max ? t.slice(0, max - 1) + "…" : t;
 }
 
-// Garante pelo menos 1 "paint" antes de começar uma sequência pesada de awaits.
-// Isso evita o efeito React 18 (batching): setLoading(true) -> cache resolve instantâneo -> setLoading(false)
-// no mesmo batch, e o usuário nunca vê a barra.
-function nextPaint(): Promise<void> {
-  return new Promise((resolve) => {
-    try {
-      if (typeof window !== "undefined" && typeof window.requestAnimationFrame === "function") {
-        window.requestAnimationFrame(() => resolve());
-        return;
-      }
-    } catch {
-      // ignora
-    }
-    setTimeout(() => resolve(), 0);
-  });
-}
-
 function isEmptySubValue(v: unknown): boolean {
   if (v === null || v === undefined) return true;
   if (typeof v === "number") return v === 0;
@@ -664,11 +647,7 @@ export default function CgimAnalyticsPage() {
       setLastUpdated(null);
 
       setLoading(true);
-      setChartsLoading(true);
       setProgress(null);
-
-      // ✅ força ao menos 1 render do loader antes do fetch (importante quando dados vêm do cache)
-      await nextPaint();
 
       try {
         const dictEntries = await loadDictionary(entity);
@@ -1098,8 +1077,7 @@ export default function CgimAnalyticsPage() {
   };
 
   // ✅ AQUI: barra sticky volta a cobrir TABELA e GRÁFICOS
-  // Mostra loader tanto no carregamento de tabela quanto no de gráficos.
-  // (antes estava só em chartsLoading, e o usuário ficava sem feedback durante o fetch principal.)
+  // ✅ também mostrar loader durante carregamento da tabela (não só gráficos)
   const showTopLoading = loading || chartsLoading;
   const topLoadingTitle = loading ? "Carregando tabela…" : "Carregando gráficos…";
   const hasProgress = !!(progress && progress.total);

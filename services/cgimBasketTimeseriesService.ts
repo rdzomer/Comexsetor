@@ -1,5 +1,5 @@
 // services/cgimBasketTimeseriesService.ts
-import { fetchComexData, type TradeFlowUi } from "./comexApiService";
+import { fetchComexYearByNcmList, type TradeFlowUi } from "./comexApiService";
 
 export type BasketAnnualPoint = {
   year: number;
@@ -90,38 +90,41 @@ export async function fetchBasketAnnualSeries(args: {
     if (cached) return cached;
   }
 
-  const period = { from: `${yearStart}-01`, to: `${yearEnd}-12` };
+  // ✅ Evita 429 (rate limit) no modo “cesta completa”:
+  // ao invés de um POST gigante com todos os NCMs + vários anos,
+  // buscamos ano a ano usando o helper já chunkado (fetchComexYearByNcmList).
+  const out: BasketAnnualPoint[] = [];
 
-  const rows = await fetchComexData(
-    flow,
-    period,
-    [{ filter: "ncm", values: ncms }],
-    ["metricFOB", "metricKG"],
-    [] // sem groupBy -> agregado por ano (como no módulo NCM)
-  );
+  const lite = ncms.length > 80; // heurística simples
+  const delayMs = lite ? 250 : 0;
 
-  // agrega defensivamente por ano (caso a API retorne múltiplas linhas)
-  const byYear = new Map<number, { fob: number; kg: number }>();
+  for (let y = yearStart; y <= yearEnd; y++) {
+    if (delayMs) {
+      await new Promise((r) => setTimeout(r, delayMs));
+    }
 
-  for (const r of rows || []) {
-    const y = pickYear(r);
-    if (!y) continue;
-    const fob = pickFOB(r);
-    const kg = pickKG(r);
+    const rows = await fetchComexYearByNcmList({
+      flow,
+      year: y,
+      ncms,
+      lite,
+    });
 
-    if (!byYear.has(y)) byYear.set(y, { fob: 0, kg: 0 });
-    const cur = byYear.get(y)!;
-    cur.fob += fob;
-    cur.kg += kg;
+    let fob = 0;
+    let kg = 0;
+    for (const r of rows || []) {
+      fob += Number(r?.fob ?? 0) || 0;
+      kg += Number(r?.kg ?? 0) || 0;
+    }
+
+    const usdPerTon = kg > 0 ? fob / (kg / 1000) : 0;
+    out.push({ year: y, fob, kg, usdPerTon });
   }
 
-  const out: BasketAnnualPoint[] = Array.from(byYear.entries())
-    .map(([year, v]) => {
-      const usdPerTon = v.kg > 0 ? v.fob / (v.kg / 1000) : 0;
-      return { year, fob: v.fob, kg: v.kg, usdPerTon };
-    })
-    .sort((a, b) => a.year - b.year);
+  // ✅ não cachear vazio (evita “congelar” falha / rate limit)
+  if (useCache && out.some((p) => (p.fob ?? 0) !== 0 || (p.kg ?? 0) !== 0)) {
+    setCache(key, out);
+  }
 
-  if (useCache) setCache(key, out);
   return out;
 }
