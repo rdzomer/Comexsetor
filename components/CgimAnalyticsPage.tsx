@@ -75,6 +75,23 @@ function truncateLabel(s: string, max = 70) {
   return t.length > max ? t.slice(0, max - 1) + "…" : t;
 }
 
+// Garante pelo menos 1 "paint" antes de começar uma sequência pesada de awaits.
+// Isso evita o efeito React 18 (batching): setLoading(true) -> cache resolve instantâneo -> setLoading(false)
+// no mesmo batch, e o usuário nunca vê a barra.
+function nextPaint(): Promise<void> {
+  return new Promise((resolve) => {
+    try {
+      if (typeof window !== "undefined" && typeof window.requestAnimationFrame === "function") {
+        window.requestAnimationFrame(() => resolve());
+        return;
+      }
+    } catch {
+      // ignora
+    }
+    setTimeout(() => resolve(), 0);
+  });
+}
+
 function isEmptySubValue(v: unknown): boolean {
   if (v === null || v === undefined) return true;
   if (typeof v === "number") return v === 0;
@@ -647,7 +664,11 @@ export default function CgimAnalyticsPage() {
       setLastUpdated(null);
 
       setLoading(true);
+      setChartsLoading(true);
       setProgress(null);
+
+      // ✅ força ao menos 1 render do loader antes do fetch (importante quando dados vêm do cache)
+      await nextPaint();
 
       try {
         const dictEntries = await loadDictionary(entity);
@@ -725,17 +746,14 @@ export default function CgimAnalyticsPage() {
           )
         ) as string[];
 
-        const autoLite = Boolean(import.meta.env.PROD) || ncmsAllUnique.length > 120;
-
         const [basketImportRows, basketExportRows]: [CgimAnnualBasketRow[], CgimAnnualBasketRow[]] =
           await Promise.all([
             fetchAnnualBasketByNcm({
               year: String(year),
               flow: "import",
               ncms: ncmsAllUnique,
-              lite: autoLite,
-              chunkSize: autoLite ? 20 : 60,
-              concurrency: autoLite ? 1 : 2,
+              chunkSize: 60,
+              concurrency: 2,
               onProgress: (info) => {
                 if (!cancelled) setProgress(info);
               },
@@ -744,9 +762,8 @@ export default function CgimAnalyticsPage() {
               year: String(year),
               flow: "export",
               ncms: ncmsAllUnique,
-              lite: autoLite,
-              chunkSize: autoLite ? 20 : 60,
-              concurrency: autoLite ? 1 : 2,
+              chunkSize: 60,
+              concurrency: 2,
               // não precisa progredir 2x; mantém o mesmo callback
               onProgress: (info) => {
                 if (!cancelled) setProgress(info);
@@ -829,13 +846,9 @@ export default function CgimAnalyticsPage() {
       }
     }
 
-    const t = window.setTimeout(() => {
-      if (!cancelled) run();
-    }, 250);
-
+    run();
     return () => {
       cancelled = true;
-      window.clearTimeout(t);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [entity, year, flow, subcatDepth]);
@@ -1085,7 +1098,9 @@ export default function CgimAnalyticsPage() {
   };
 
   // ✅ AQUI: barra sticky volta a cobrir TABELA e GRÁFICOS
-  const showTopLoading = chartsLoading;
+  // Mostra loader tanto no carregamento de tabela quanto no de gráficos.
+  // (antes estava só em chartsLoading, e o usuário ficava sem feedback durante o fetch principal.)
+  const showTopLoading = loading || chartsLoading;
   const topLoadingTitle = loading ? "Carregando tabela…" : "Carregando gráficos…";
   const hasProgress = !!(progress && progress.total);
   const pct = hasProgress
