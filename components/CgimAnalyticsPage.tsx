@@ -725,14 +725,17 @@ export default function CgimAnalyticsPage() {
           )
         ) as string[];
 
+        const autoLite = Boolean(import.meta.env.PROD) || ncmsAllUnique.length > 120;
+
         const [basketImportRows, basketExportRows]: [CgimAnnualBasketRow[], CgimAnnualBasketRow[]] =
           await Promise.all([
             fetchAnnualBasketByNcm({
               year: String(year),
               flow: "import",
               ncms: ncmsAllUnique,
-              chunkSize: 60,
-              concurrency: 2,
+              lite: autoLite,
+              chunkSize: autoLite ? 20 : 60,
+              concurrency: autoLite ? 1 : 2,
               onProgress: (info) => {
                 if (!cancelled) setProgress(info);
               },
@@ -741,8 +744,9 @@ export default function CgimAnalyticsPage() {
               year: String(year),
               flow: "export",
               ncms: ncmsAllUnique,
-              chunkSize: 60,
-              concurrency: 2,
+              lite: autoLite,
+              chunkSize: autoLite ? 20 : 60,
+              concurrency: autoLite ? 1 : 2,
               // não precisa progredir 2x; mantém o mesmo callback
               onProgress: (info) => {
                 if (!cancelled) setProgress(info);
@@ -825,9 +829,13 @@ export default function CgimAnalyticsPage() {
       }
     }
 
-    run();
+    const t = window.setTimeout(() => {
+      if (!cancelled) run();
+    }, 250);
+
     return () => {
       cancelled = true;
+      window.clearTimeout(t);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [entity, year, flow, subcatDepth]);
