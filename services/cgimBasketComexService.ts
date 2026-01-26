@@ -41,6 +41,7 @@ export interface BasketOptions {
   useCache?: boolean;    // default true
   cacheTtlHours?: number;// default 72
   onProgress?: (p: BasketProgress) => void;
+  lite?: boolean; // ✅ modo CGIM leve (reduz volume de requests)
 }
 
 export interface CgimAnnualBasketRow {
@@ -59,6 +60,7 @@ export interface FetchAnnualBasketByNcmArgs {
   useCache?: boolean;
   cacheTtlHours?: number;
   onProgress?: (info: { done: number; total: number }) => void;
+  lite?: boolean; // ✅ modo CGIM leve
 }
 
 function chunkArray<T>(arr: T[], size: number): T[][] {
@@ -66,6 +68,30 @@ function chunkArray<T>(arr: T[], size: number): T[][] {
   const n = Math.max(1, Math.floor(size || 1));
   for (let i = 0; i < arr.length; i += n) out.push(arr.slice(i, i + n));
   return out;
+}
+
+function detectCgimLite(explicit?: boolean): boolean {
+  if (typeof explicit === "boolean") return explicit;
+
+  // Sem window (SSR/build): default off
+  if (typeof window === "undefined") return false;
+
+  try {
+    const qs = new URLSearchParams(window.location.search || "");
+    const q = qs.get("cgimLite") || qs.get("lite") || "";
+    if (q === "1" || q === "true" || q === "on") return true;
+  } catch {
+    // ignore
+  }
+
+  try {
+    const v = window.localStorage?.getItem("cgimLite") || "";
+    if (v === "1" || v === "true" || v === "on") return true;
+  } catch {
+    // ignore
+  }
+
+  return false;
 }
 
 const DEFAULTS = {
@@ -211,8 +237,10 @@ export async function fetchAnnualBasketByNcm(args: FetchAnnualBasketByNcmArgs): 
 
   const useCache = args.useCache ?? true;
   const ttl = args.cacheTtlHours ?? 72;
-  const concurrency = Math.max(1, args.concurrency ?? 2);
-  const batchSize = Math.max(10, Math.min(60, args.chunkSize ?? 40));
+  const lite = detectCgimLite(args.lite);
+
+  const concurrency = lite ? 1 : Math.max(1, args.concurrency ?? 2);
+  const batchSize = lite ? 20 : Math.max(10, Math.min(60, args.chunkSize ?? 40));
 
   // 1) tenta resolver via cache primeiro
   const valuesByNcm = new Map<string, { fob: number; kg: number }>();
@@ -247,7 +275,7 @@ export async function fetchAnnualBasketByNcm(args: FetchAnnualBasketByNcmArgs): 
     for (const sub of retryChunks) {
       let subRows: NcmYearRow[] = [];
       try {
-        subRows = await fetchComexYearByNcmList({ flow, year: yearNum, ncms: sub });
+        subRows = await fetchComexYearByNcmList({ flow, year: yearNum, ncms: sub, lite });
       } catch {
         subRows = [];
       }
@@ -276,7 +304,7 @@ export async function fetchAnnualBasketByNcm(args: FetchAnnualBasketByNcmArgs): 
   await runPool(chunks, concurrency, async (chunk) => {
     let rows: NcmYearRow[] = [];
     try {
-      rows = await fetchComexYearByNcmList({ flow, year: yearNum, ncms: chunk });
+      rows = await fetchComexYearByNcmList({ flow, year: yearNum, ncms: chunk, lite });
     } catch {
       // fallback abaixo
       rows = [];

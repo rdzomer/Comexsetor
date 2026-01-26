@@ -135,6 +135,14 @@ async function fetchWithTimeout(url: string, timeoutMs: number, init?: RequestIn
   }
 }
 
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+
+
+
 /**
  * 🔧 AÇÃO MÍNIMA (auditoria):
  * Corrige payload legado quando alguém usa "noNcmpt" como filtro (errado) passando código NCM.
@@ -346,7 +354,15 @@ function parseGeneralResponseToValue(json: any): NcmYearValue {
 }
 
 // ====== ✅ NOVO CORE: /general via POST + body (Swagger) ======
-async function comexGeneralRequest(payload: any, timeoutMs = DEFAULT_TIMEOUT_MS): Promise<any[]> {
+type ComexGeneralMeta = {
+  ok: boolean;
+  status: number;
+  statusText: string;
+  rows: any[];
+  errorText?: string;
+};
+
+async function comexGeneralRequestWithMeta(payload: any, timeoutMs = DEFAULT_TIMEOUT_MS): Promise<ComexGeneralMeta> {
   try {
     const url = GENERAL_ENDPOINT;
 
@@ -371,16 +387,23 @@ async function comexGeneralRequest(payload: any, timeoutMs = DEFAULT_TIMEOUT_MS)
     if (!res.ok) {
       const txt = await res.text().catch(() => "");
       console.warn("[comexApiService] /general falhou:", res.status, res.statusText, txt);
-      return [];
+      return { ok: false, status: res.status, statusText: res.statusText, rows: [], errorText: txt };
     }
 
     const json = await res.json();
-    return extractRows(json);
-  } catch (e) {
+    return { ok: true, status: res.status, statusText: res.statusText, rows: extractRows(json) };
+  } catch (e: any) {
     console.warn("[comexApiService] Falha ao consultar /general (POST). Retornando lista vazia.", e);
-    return [];
+    return { ok: false, status: 0, statusText: "NETWORK_ERROR", rows: [], errorText: String(e?.message ?? e) };
   }
 }
+
+// ====== ✅ NOVO CORE: /general via POST + body (Swagger) ======
+async function comexGeneralRequest(payload: any, timeoutMs = DEFAULT_TIMEOUT_MS): Promise<any[]> {
+  const meta = await comexGeneralRequestWithMeta(payload, timeoutMs);
+  return meta.rows || [];
+}
+
 
 function mapFiltersToComex(filterList: any[], filterArray: any[], detailDatabase: any[], filters: ApiFilter[]) {
   for (const f of filters || []) {
@@ -684,11 +707,14 @@ export async function fetchComexYearByNcm(args: {
  * ✅ NOVO (CGIM em lote): busca FOB/KG para UMA LISTA de NCMs
  * Agora com chunk + limite de concorrência para reduzir bloqueios.
  */
-export async function fetchComexYearByNcmList(args: {
-  flow: TradeFlow | TradeFlowUi; // aceita "imp|exp" ou "import|export"
-  year: number;
-  ncms: string[];
-}): Promise<NcmYearRow[]> {
+export async function fetchComexYearByNcmList(
+  args: {
+    flow: TradeFlow | TradeFlowUi; // aceita "imp|exp" ou "import|export"
+    year: number;
+    ncms: string[];
+    lite?: boolean; // ✅ modo CGIM leve (reduz chunk/concurrency e aplica backoff em 429)
+  }
+): Promise<NcmYearRow[]> {
   const year = Number(args.year);
 
   const ncms8 = (args.ncms ?? [])
@@ -708,7 +734,14 @@ export async function fetchComexYearByNcmList(args: {
   };
 
   // ---- execução com limite de concorrência ----
-  const chunks = chunk(ncms8, CGIM_MAX_NCMS_PER_REQUEST);
+  const lite = Boolean(args.lite);
+
+  const chunkSize = lite ? 20 : CGIM_MAX_NCMS_PER_REQUEST;
+  const maxConcurrency = lite ? 1 : CGIM_MAX_CONCURRENCY;
+  const delayBetweenChunksMs = lite ? 500 : 0;
+  const retry429WaitMs = lite ? 11_000 : 0;
+
+  const chunks = chunk(ncms8, chunkSize);
 
   const results: NcmYearRow[] = [];
   let idx = 0;
@@ -736,7 +769,19 @@ export async function fetchComexYearByNcmList(args: {
         langDefault: "pt",
       };
 
-      const rows = await comexGeneralRequest(payload);
+      if (delayBetweenChunksMs > 0) {
+        await sleep(delayBetweenChunksMs);
+      }
+
+      let meta = await comexGeneralRequestWithMeta(payload);
+
+      // ✅ Modo CGIM leve: backoff simples em 429 (rate limit)
+      if (!meta.ok && meta.status === 429 && retry429WaitMs > 0) {
+        await sleep(retry429WaitMs);
+        meta = await comexGeneralRequestWithMeta(payload);
+      }
+
+      const rows = meta.rows || [];
 
       for (const r of rows ?? []) {
         const rawNcm =
@@ -762,7 +807,7 @@ export async function fetchComexYearByNcmList(args: {
     }
   };
 
-  const concurrency = Math.max(1, Math.min(CGIM_MAX_CONCURRENCY, chunks.length));
+  const concurrency = Math.max(1, Math.min(maxConcurrency, chunks.length));
   const workers = Array.from({ length: concurrency }, () => worker());
 
   await Promise.allSettled(workers);
