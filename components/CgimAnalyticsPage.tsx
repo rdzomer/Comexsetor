@@ -1077,7 +1077,7 @@ export default function CgimAnalyticsPage() {
   };
 
   // ✅ AQUI: barra sticky volta a cobrir TABELA e GRÁFICOS
-  const showTopLoading = loading || chartsLoading;
+  const showTopLoading = chartsLoading;
   const topLoadingTitle = loading ? "Carregando tabela…" : "Carregando gráficos…";
   const hasProgress = !!(progress && progress.total);
   const pct = hasProgress
