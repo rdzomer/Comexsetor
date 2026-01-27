@@ -656,8 +656,7 @@ export default function CgimAnalyticsPage() {
 
         setLoading(true);
         // Mostra barra imediatamente (independente do callback de progresso)
-        // ⚠️ Não use o tamanho da cesta aqui (a lista de NCMs ainda não foi calculada). Evita ReferenceError em produção.
-        setProgress({ done: 0, total: 1 });
+        setProgress({ done: 0, total: 1 }); // evita ReferenceError: ncmsAllUnique ainda não foi calculado
 
       try {
         const dictEntries = await loadDictionary(entity);
