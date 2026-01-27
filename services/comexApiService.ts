@@ -150,8 +150,8 @@ function sleep(ms: number): Promise<void> {
 // Estratégia: fila global + espaçamento mínimo entre chamadas ao /general.
 // - Não muda arquitetura
 // - Afeta CGIM e NCM (mais lento, porém estável)
-const GENERAL_MIN_INTERVAL_MS = 650;   // 400–900ms; aqui priorizamos estabilidade
-const GENERAL_COOLDOWN_429_MS = 8_000; // espera extra quando a API responder 429
+const GENERAL_MIN_INTERVAL_MS = 1500;  // ↑ mais conservador p/ evitar 429   // 400–900ms; aqui priorizamos estabilidade
+const GENERAL_COOLDOWN_429_MS = 20_000; // ↑ janela de cooldown maior após 429 // espera extra quando a API responder 429
 
 let _generalTail: Promise<any> = Promise.resolve();
 let _generalLastAt = 0;
@@ -177,8 +177,8 @@ async function enqueueGeneral<T>(task: () => Promise<T>): Promise<T> {
   return run;
 }
 
-function noteGeneral429() {
-  _generalCooldownUntil = Math.max(_generalCooldownUntil, Date.now() + GENERAL_COOLDOWN_429_MS);
+function noteGeneral429(extraMs: number = GENERAL_COOLDOWN_429_MS) {
+  _generalCooldownUntil = Math.max(_generalCooldownUntil, Date.now() + extraMs);
 }
 /**
  * 🔧 AÇÃO MÍNIMA (auditoria):
@@ -434,13 +434,21 @@ while (attempt < maxAttempts) {
 
   if (res.ok) break;
 
-  // 429: marca cooldown e tenta novamente com espera incremental
-  if (res.status === 429) {
-    noteGeneral429();
-    const backoff = 1200 * attempt; // 1.2s, 2.4s, 3.6s...
-    await sleep(backoff);
-    continue;
-  }
+  
+// 429: marca cooldown e tenta novamente com espera mais conservadora
+if (res.status === 429) {
+  // tenta honrar Retry-After (quando existir)
+  const ra = res.headers.get("retry-after");
+  const retryAfterMs = ra && /^\d+$/.test(ra) ? Number(ra) * 1000 : 0;
+
+  // backoff exponencial leve + piso alto (produção)
+  const backoff = Math.min(90_000, 4000 * Math.pow(2, attempt - 1)); // 4s, 8s, 16s, 32s...
+  const waitMs = Math.max(backoff, retryAfterMs, 12_000);
+
+  noteGeneral429(waitMs);
+  await sleep(waitMs);
+  continue;
+}
 
   // outros erros: não insistir em loop
   break;
