@@ -237,10 +237,17 @@ export async function fetchAnnualBasketByNcm(args: FetchAnnualBasketByNcmArgs): 
 
   const useCache = args.useCache ?? true;
   const ttl = args.cacheTtlHours ?? 72;
-  const lite = detectCgimLite(args.lite);
+  const liteDetected = detectCgimLite(args.lite);
 
-  const concurrency = lite ? 1 : Math.max(1, args.concurrency ?? 2);
-  const batchSize = lite ? 20 : Math.max(10, Math.min(60, args.chunkSize ?? 40));
+// ✅ Robustez (produção): cestas grandes estouram 429 fácil.
+// Estratégia mínima: força modo "lite" quando a cesta é grande, e executa em 1 fila.
+const lite = total > 30 ? true : liteDetected;
+
+// ✅ sempre 1 por vez (a fila global do comexApiService já ajuda, mas aqui evitamos rajada de enfileiramento)
+const concurrency = 1;
+
+// ✅ batch menor = menos chance de 429 e de truncamento parcial
+const batchSize = lite ? 8 : Math.max(8, Math.min(25, args.chunkSize ?? 15));
 
   // 1) tenta resolver via cache primeiro
   const valuesByNcm = new Map<string, { fob: number; kg: number }>();

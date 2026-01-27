@@ -95,8 +95,10 @@ export async function fetchBasketAnnualSeries(args: {
   // buscamos ano a ano usando o helper já chunkado (fetchComexYearByNcmList).
   const out: BasketAnnualPoint[] = [];
 
-  const lite = ncms.length > 80; // heurística simples
-  const delayMs = lite ? 250 : 0;
+  // ✅ Robustez: séries anuais chamam /general várias vezes (ano a ano).
+// Para evitar 429 em produção, forçamos "lite" quando a cesta é média/grande e aplicamos delay fixo.
+const lite = ncms.length > 25;
+const delayMs = lite ? 750 : 250;
 
   for (let y = yearStart; y <= yearEnd; y++) {
     if (delayMs) {

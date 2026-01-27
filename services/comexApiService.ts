@@ -143,6 +143,43 @@ function sleep(ms: number): Promise<void> {
 
 
 
+
+
+// ===== GLOBAL RATE LIMIT (CLIENT-SIDE) =====
+// Objetivo: evitar rajadas que disparam 429 em produção (Netlify/browser).
+// Estratégia: fila global + espaçamento mínimo entre chamadas ao /general.
+// - Não muda arquitetura
+// - Afeta CGIM e NCM (mais lento, porém estável)
+const GENERAL_MIN_INTERVAL_MS = 650;   // 400–900ms; aqui priorizamos estabilidade
+const GENERAL_COOLDOWN_429_MS = 8_000; // espera extra quando a API responder 429
+
+let _generalTail: Promise<any> = Promise.resolve();
+let _generalLastAt = 0;
+let _generalCooldownUntil = 0;
+
+async function enqueueGeneral<T>(task: () => Promise<T>): Promise<T> {
+  const run = _generalTail.then(async () => {
+    const now = Date.now();
+    const waitForSpacing = Math.max(0, GENERAL_MIN_INTERVAL_MS - (now - _generalLastAt));
+    const waitForCooldown = Math.max(0, _generalCooldownUntil - now);
+    const wait = Math.max(waitForSpacing, waitForCooldown);
+    if (wait > 0) await sleep(wait);
+
+    try {
+      return await task();
+    } finally {
+      _generalLastAt = Date.now();
+    }
+  });
+
+  // mantém a fila viva mesmo se um request falhar
+  _generalTail = run.catch(() => undefined);
+  return run;
+}
+
+function noteGeneral429() {
+  _generalCooldownUntil = Math.max(_generalCooldownUntil, Date.now() + GENERAL_COOLDOWN_429_MS);
+}
 /**
  * 🔧 AÇÃO MÍNIMA (auditoria):
  * Corrige payload legado quando alguém usa "noNcmpt" como filtro (errado) passando código NCM.
@@ -378,13 +415,38 @@ async function comexGeneralRequestWithMeta(payload: any, timeoutMs = DEFAULT_TIM
 
     const body = isNewShape ? sanitized : legacyToNewGeneralBody(sanitized);
 
-    const res = await fetchWithTimeout(url, timeoutMs, {
+    
+// ✅ Fila global + backoff simples para reduzir 429 (produção)
+const maxAttempts = 4; // 1 inicial + 3 retries leves
+let attempt = 0;
+let res: Response | null = null;
+
+while (attempt < maxAttempts) {
+  attempt++;
+
+  res = await enqueueGeneral(() =>
+    fetchWithTimeout(url, timeoutMs, {
       method: "POST",
       headers: { "Content-Type": "application/json", Accept: "application/json" },
       body: JSON.stringify(body),
-    });
+    })
+  );
 
-    if (!res.ok) {
+  if (res.ok) break;
+
+  // 429: marca cooldown e tenta novamente com espera incremental
+  if (res.status === 429) {
+    noteGeneral429();
+    const backoff = 1200 * attempt; // 1.2s, 2.4s, 3.6s...
+    await sleep(backoff);
+    continue;
+  }
+
+  // outros erros: não insistir em loop
+  break;
+}
+
+if (!res || !res.ok) {
       const txt = await res.text().catch(() => "");
       console.warn("[comexApiService] /general falhou:", res.status, res.statusText, txt);
       return { ok: false, status: res.status, statusText: res.statusText, rows: [], errorText: txt };
@@ -690,16 +752,7 @@ export async function fetchComexYearByNcm(args: {
   };
 
   try {
-    // ✅ Evita “zerar” por rate-limit (429) no fallback 1-a-1 do CGIM
-    let meta = await comexGeneralRequestWithMeta(payload);
-
-    // backoff simples (mesma ordem do modo lite em lote)
-    if (!meta.ok && meta.status === 429) {
-      await sleep(11_000);
-      meta = await comexGeneralRequestWithMeta(payload);
-    }
-
-    const resRows = meta.rows || [];
+    const resRows = await comexGeneralRequest(payload);
     if (!resRows.length) return { fob: 0, kg: 0 };
     const r = resRows[0];
     return {
