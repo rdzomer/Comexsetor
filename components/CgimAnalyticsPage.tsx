@@ -558,6 +558,10 @@ export default function CgimAnalyticsPage() {
   } | null>(null);
   const [error, setError] = React.useState<string | null>(null);
 
+  // ✅ Evita múltiplos fetches simultâneos (React StrictMode / cliques rápidos)
+  const inFlightTableKeyRef = React.useRef<string | null>(null);
+  const inFlightChartsKeyRef = React.useRef<string | null>(null);
+
   const [tree, setTree] = React.useState<HierarchyNode[]>([]);
   const [tableTree, setTableTree] = React.useState<any[]>([]);
   const [lastUpdated, setLastUpdated] = React.useState<Date | null>(null);
@@ -639,15 +643,21 @@ export default function CgimAnalyticsPage() {
     let cancelled = false;
 
     async function run() {
+      const tableKey = `${entity}|${year}|${flow}`;
+      if (inFlightTableKeyRef.current === tableKey) return;
+      inFlightTableKeyRef.current = tableKey;
+
       setTree([]);
-    setTableTree([]);
+      setTableTree([]);
       setExpandedIds(new Set());
       setDiagnostics(null);
       setError(null);
       setLastUpdated(null);
 
-      setLoading(true);
-      setProgress(null);
+        setLoading(true);
+        // Mostra barra imediatamente (independente do callback de progresso)
+        // ⚠️ Não use o tamanho da cesta aqui (a lista de NCMs ainda não foi calculada). Evita ReferenceError em produção.
+        setProgress({ done: 0, total: 1 });
 
       try {
         const dictEntries = await loadDictionary(entity);
@@ -725,14 +735,20 @@ export default function CgimAnalyticsPage() {
           )
         ) as string[];
 
+        // ✅ Anti-429: use o "modo leve" por padrão (pouca concorrência + backoff).
+        // O serviço já ajusta chunk/concurrency internamente.
+        const useLite = true;
+
+        // força a barra a aparecer imediatamente
+        setProgress({ done: 0, total: ncmsAllUnique.length });
+
         const [basketImportRows, basketExportRows]: [CgimAnnualBasketRow[], CgimAnnualBasketRow[]] =
           await Promise.all([
             fetchAnnualBasketByNcm({
               year: String(year),
               flow: "import",
               ncms: ncmsAllUnique,
-              chunkSize: 60,
-              concurrency: 2,
+              lite: useLite,
               onProgress: (info) => {
                 if (!cancelled) setProgress(info);
               },
@@ -741,8 +757,7 @@ export default function CgimAnalyticsPage() {
               year: String(year),
               flow: "export",
               ncms: ncmsAllUnique,
-              chunkSize: 60,
-              concurrency: 2,
+              lite: useLite,
               // não precisa progredir 2x; mantém o mesmo callback
               onProgress: (info) => {
                 if (!cancelled) setProgress(info);
@@ -818,6 +833,8 @@ export default function CgimAnalyticsPage() {
         if (cancelled) return;
         setError(e?.message ? String(e.message) : "Erro ao carregar dados.");
       } finally {
+        // libera lock de fetch
+        inFlightTableKeyRef.current = null;
         if (!cancelled) {
           setLoading(false);
           setProgress(null);
@@ -846,6 +863,10 @@ export default function CgimAnalyticsPage() {
     let t: any = null;
 
     async function runCharts() {
+      const chartsKey = `${entity}|${year}|${flow}|${selectedCategories.join(",")}|${selectedSubcategories.join(",")}`;
+      if (inFlightChartsKeyRef.current === chartsKey) return;
+      inFlightChartsKeyRef.current = chartsKey;
+
       if (!dictRowsAll.length) {
         setAnnualSeries([]);
         setAnnualPriceSeries([]);
@@ -853,8 +874,6 @@ export default function CgimAnalyticsPage() {
           setSubcatBars([]);
           setCategoryBarsKg([]);
           setSubcatBarsKg([]);
-        setCategoryBarsKg([]);
-        setSubcatBarsKg([]);
         return;
       }
 
@@ -886,6 +905,7 @@ export default function CgimAnalyticsPage() {
             yearStart,
             yearEnd,
             ncms,
+            lite: true,
             useCache: true,
             cacheTtlHours: 24,
           }),
@@ -894,6 +914,7 @@ export default function CgimAnalyticsPage() {
             yearStart,
             yearEnd,
             ncms,
+            lite: true,
             useCache: true,
             cacheTtlHours: 24,
           }),
@@ -1000,6 +1021,8 @@ export default function CgimAnalyticsPage() {
           e?.message ? String(e.message) : "Erro ao carregar gráficos."
         );
       } finally {
+        // libera lock de fetch dos gráficos
+        inFlightChartsKeyRef.current = null;
         if (!cancelled) setChartsLoading(false);
       }
     }
