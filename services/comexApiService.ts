@@ -690,7 +690,16 @@ export async function fetchComexYearByNcm(args: {
   };
 
   try {
-    const resRows = await comexGeneralRequest(payload);
+    // ✅ Evita “zerar” por rate-limit (429) no fallback 1-a-1 do CGIM
+    let meta = await comexGeneralRequestWithMeta(payload);
+
+    // backoff simples (mesma ordem do modo lite em lote)
+    if (!meta.ok && meta.status === 429) {
+      await sleep(11_000);
+      meta = await comexGeneralRequestWithMeta(payload);
+    }
+
+    const resRows = meta.rows || [];
     if (!resRows.length) return { fob: 0, kg: 0 };
     const r = resRows[0];
     return {
