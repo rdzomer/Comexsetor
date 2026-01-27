@@ -143,43 +143,6 @@ function sleep(ms: number): Promise<void> {
 
 
 
-
-
-// ===== GLOBAL RATE LIMIT (CLIENT-SIDE) =====
-// Objetivo: evitar rajadas que disparam 429 em produção (Netlify/browser).
-// Estratégia: fila global + espaçamento mínimo entre chamadas ao /general.
-// - Não muda arquitetura
-// - Afeta CGIM e NCM (mais lento, porém estável)
-const GENERAL_MIN_INTERVAL_MS = 1500;  // ↑ mais conservador p/ evitar 429   // 400–900ms; aqui priorizamos estabilidade
-const GENERAL_COOLDOWN_429_MS = 20_000; // ↑ janela de cooldown maior após 429 // espera extra quando a API responder 429
-
-let _generalTail: Promise<any> = Promise.resolve();
-let _generalLastAt = 0;
-let _generalCooldownUntil = 0;
-
-async function enqueueGeneral<T>(task: () => Promise<T>): Promise<T> {
-  const run = _generalTail.then(async () => {
-    const now = Date.now();
-    const waitForSpacing = Math.max(0, GENERAL_MIN_INTERVAL_MS - (now - _generalLastAt));
-    const waitForCooldown = Math.max(0, _generalCooldownUntil - now);
-    const wait = Math.max(waitForSpacing, waitForCooldown);
-    if (wait > 0) await sleep(wait);
-
-    try {
-      return await task();
-    } finally {
-      _generalLastAt = Date.now();
-    }
-  });
-
-  // mantém a fila viva mesmo se um request falhar
-  _generalTail = run.catch(() => undefined);
-  return run;
-}
-
-function noteGeneral429(extraMs: number = GENERAL_COOLDOWN_429_MS) {
-  _generalCooldownUntil = Math.max(_generalCooldownUntil, Date.now() + extraMs);
-}
 /**
  * 🔧 AÇÃO MÍNIMA (auditoria):
  * Corrige payload legado quando alguém usa "noNcmpt" como filtro (errado) passando código NCM.
@@ -415,46 +378,13 @@ async function comexGeneralRequestWithMeta(payload: any, timeoutMs = DEFAULT_TIM
 
     const body = isNewShape ? sanitized : legacyToNewGeneralBody(sanitized);
 
-    
-// ✅ Fila global + backoff simples para reduzir 429 (produção)
-const maxAttempts = 4; // 1 inicial + 3 retries leves
-let attempt = 0;
-let res: Response | null = null;
-
-while (attempt < maxAttempts) {
-  attempt++;
-
-  res = await enqueueGeneral(() =>
-    fetchWithTimeout(url, timeoutMs, {
+    const res = await fetchWithTimeout(url, timeoutMs, {
       method: "POST",
       headers: { "Content-Type": "application/json", Accept: "application/json" },
       body: JSON.stringify(body),
-    })
-  );
+    });
 
-  if (res.ok) break;
-
-  
-// 429: marca cooldown e tenta novamente com espera mais conservadora
-if (res.status === 429) {
-  // tenta honrar Retry-After (quando existir)
-  const ra = res.headers.get("retry-after");
-  const retryAfterMs = ra && /^\d+$/.test(ra) ? Number(ra) * 1000 : 0;
-
-  // backoff exponencial leve + piso alto (produção)
-  const backoff = Math.min(90_000, 4000 * Math.pow(2, attempt - 1)); // 4s, 8s, 16s, 32s...
-  const waitMs = Math.max(backoff, retryAfterMs, 12_000);
-
-  noteGeneral429(waitMs);
-  await sleep(waitMs);
-  continue;
-}
-
-  // outros erros: não insistir em loop
-  break;
-}
-
-if (!res || !res.ok) {
+    if (!res.ok) {
       const txt = await res.text().catch(() => "");
       console.warn("[comexApiService] /general falhou:", res.status, res.statusText, txt);
       return { ok: false, status: res.status, statusText: res.statusText, rows: [], errorText: txt };
@@ -777,13 +707,92 @@ export async function fetchComexYearByNcm(args: {
  * ✅ NOVO (CGIM em lote): busca FOB/KG para UMA LISTA de NCMs
  * Agora com chunk + limite de concorrência para reduzir bloqueios.
  */
-export async function fetchComexYearByNcmList(
-  args: {
-    flow: TradeFlow | TradeFlowUi; // aceita "imp|exp" ou "import|export"
-    year: number;
-    ncms: string[];
-    lite?: boolean; // ✅ modo CGIM leve (reduz chunk/concurrency e aplica backoff em 429)
+export async function fetchComexYearByNcmList(args: {
+  year: string;
+  flow: "import" | "export";
+  ncms: string[];
+  lite?: boolean;
+  /**
+   * Callback opcional para atualizar barra de progresso na UI.
+   * done/total contam NCMs processados (não requests).
+   */
+  onProgress?: (info: { done: number; total: number; chunk: number; chunks: number }) => void;
+}): Promise<NcmYearRow[]> {
+  const year = args.year;
+  const flow = args.flow;
+  const lite = !!args.lite;
+  const onProgress = args.onProgress;
+
+  // normaliza NCMs (8 dígitos, numérico)
+  const ncms = (args.ncms || [])
+    .map((x) => String(x || "").replace(/\D/g, ""))
+    .filter((x) => x.length === 8);
+
+  if (ncms.length === 0) return [];
+
+  // Para evitar 429 em produção, prioriza poucos requests grandes (por lista)
+  //  - lite: chunk menor (resposta mais rápida)
+  //  - normal: chunk maior (menos chamadas)
+  const chunkSize = lite ? 50 : 120;
+  const chunks = Math.max(1, Math.ceil(ncms.length / chunkSize));
+
+  const out: NcmYearRow[] = [];
+  let done = 0;
+
+  for (let c = 0; c < chunks; c++) {
+    const slice = ncms.slice(c * chunkSize, (c + 1) * chunkSize);
+
+    // Monta filtro por LISTA (tentando primeiro "coNcm", fallback "noNcmpt")
+    const buildReq = (id: "coNcm" | "noNcmpt") => {
+      const filterList = [{ id }];
+      const filterArray = [{ item: slice, idInput: id }];
+      // detailDatabase só se precisar detalhar/agrupador
+      return buildComexRequest({
+        flow,
+        year,
+        filterList,
+        filterArray,
+        monthDetail: false,
+        details: ["noNcmpt"],
+        metrics: ["metricFOB", "metricKG"],
+      });
+    };
+
+    // 1) tenta coNcm
+    let rows = await comexGeneralRequestWithMeta<NcmYearRow[]>(buildReq("coNcm")).then((r) => r.data || []);
+
+    // 2) fallback (só se veio vazio)
+    if (rows.length === 0) {
+      rows = await comexGeneralRequestWithMeta<NcmYearRow[]>(buildReq("noNcmpt")).then((r) => r.data || []);
+    }
+
+    out.push(...rows);
+
+    done += slice.length;
+    if (onProgress) onProgress({ done, total: ncms.length, chunk: c + 1, chunks });
   }
+
+  // Garantia: se a API não devolver algo para algum NCM, devolvemos zero para manter consistência
+  const byNcm = new Map<string, NcmYearRow>();
+  for (const r of out) {
+    const n = String((r as any).noNcmpt ?? (r as any).ncm ?? "").replace(/\D/g, "");
+    if (!n) continue;
+    byNcm.set(n, {
+      ...(r as any),
+      noNcmpt: n,
+    });
+  }
+
+  return ncms.map((ncm) => {
+    const r = byNcm.get(ncm);
+    if (r) return r;
+    return {
+      noNcmpt: ncm,
+      metricFOB: 0,
+      metricKG: 0,
+    } as any;
+  });
+}
 ): Promise<NcmYearRow[]> {
   const year = Number(args.year);
 

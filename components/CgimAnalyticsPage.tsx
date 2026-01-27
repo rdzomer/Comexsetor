@@ -32,10 +32,7 @@ import {
 } from "../utils/cgimAggregation";
 
 import * as cgimDictionaryService from "../services/cgimDictionaryService";
-import {
-  fetchAnnualBasketByNcm,
-  type CgimAnnualBasketRow,
-} from "../services/cgimBasketComexService";
+import { fetchComexYearByNcmList } from "../services/comexApiService";
 import { fetchBasketAnnualSeries } from "../services/cgimBasketTimeseriesService";
 
 type SortKey = "fob" | "kg";
@@ -656,7 +653,7 @@ export default function CgimAnalyticsPage() {
 
         setLoading(true);
         // Mostra barra imediatamente (independente do callback de progresso)
-        setProgress({ done: 0, total: 1 }); // evita ReferenceError: ncmsAllUnique ainda não foi calculado
+        setProgress({ done: 0, total: Math.max(1, ncmsAllUnique.length * 2) });
 
       try {
         const dictEntries = await loadDictionary(entity);
@@ -739,45 +736,42 @@ export default function CgimAnalyticsPage() {
         const useLite = true;
 
         // força a barra a aparecer imediatamente
-        setProgress({ done: 0, total: ncmsAllUnique.length });
+    setLoading(true);
+    setError(null);
+    setProgress({ current: 0, total: ncmsAllUnique.length });
 
-        let basketImportRows: CgimAnnualBasketRow[] = [];
-        let basketExportRows: CgimAnnualBasketRow[] = [];
+    // Busca Comex (ano cheio) para TODOS os NCMs únicos com chunking (bem menos requests)
+    const importRaw = await fetchComexYearByNcmList({
+      year: String(year),
+      flow: "import",
+      ncms: ncmsAllUnique,
+      lite: isLite,
+      onProgress: ({ done, total }) => setProgress({ current: done, total }),
+    });
 
-        try {
-          [basketImportRows, basketExportRows] = await Promise.all([
-            fetchAnnualBasketByNcm({
-              year: String(year),
-              flow: "import",
-              ncms: ncmsAllUnique,
-              lite: useLite,
-              onProgress: (info) => {
-                if (!cancelled) setProgress(info);
-              },
-            }),
-            fetchAnnualBasketByNcm({
-              year: String(year),
-              flow: "export",
-              ncms: ncmsAllUnique,
-              lite: useLite,
-              onProgress: (info) => {
-                if (!cancelled) setProgress(info);
-              },
-            }),
-          ]);
-        } catch (err: any) {
-          if (cancelled) return;
+    if (cancelled) return;
 
-          const msg =
-            err?.status === 429
-              ? "A API do ComexStat limitou o volume de requisições (429). O app vai precisar de mais tempo entre chamadas — tente novamente em 1-2 minutos."
-              : `Erro ao consultar o ComexStat: ${err?.message || String(err)}`;
+    const exportRaw = await fetchComexYearByNcmList({
+      year: String(year),
+      flow: "export",
+      ncms: ncmsAllUnique,
+      lite: isLite,
+    });
 
-          setWarning(msg);
-          setLoadingStage("erro");
-          setIsLoading(false);
-          return;
-        }
+    if (cancelled) return;
+
+    const basketImportRows = importRaw.map((r: any) => ({
+      ncm: String(r.noNcmpt ?? "").replace(/\D/g, ""),
+      metricFOB: Number(r.metricFOB) || 0,
+      metricKG: Number(r.metricKG) || 0,
+    }));
+
+    const basketExportRows = exportRaw.map((r: any) => ({
+      ncm: String(r.noNcmpt ?? "").replace(/\D/g, ""),
+      metricFOB: Number(r.metricFOB) || 0,
+      metricKG: Number(r.metricKG) || 0,
+    }));
+
 
         if (cancelled) return;
 
@@ -1386,4 +1380,11 @@ const compositionSubcategoryTextKg =
     </div>
     </>
   );
+
+    // mapa rápido NCM -> (categoria, subcategoria)
+    const dictByNcm = new Map<string, { category: string; subcategory: string }>();
+    for (const r of dictRowsRawAll) {
+      dictByNcm.set(r.ncm, { category: r.category, subcategory: r.subcategory });
+    }
+
 }
