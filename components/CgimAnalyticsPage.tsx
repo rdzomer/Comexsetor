@@ -741,8 +741,11 @@ export default function CgimAnalyticsPage() {
         // força a barra a aparecer imediatamente
         setProgress({ done: 0, total: ncmsAllUnique.length });
 
-        const [basketImportRows, basketExportRows]: [CgimAnnualBasketRow[], CgimAnnualBasketRow[]] =
-          await Promise.all([
+        let basketImportRows: CgimAnnualBasketRow[] = [];
+        let basketExportRows: CgimAnnualBasketRow[] = [];
+
+        try {
+          [basketImportRows, basketExportRows] = await Promise.all([
             fetchAnnualBasketByNcm({
               year: String(year),
               flow: "import",
@@ -757,12 +760,24 @@ export default function CgimAnalyticsPage() {
               flow: "export",
               ncms: ncmsAllUnique,
               lite: useLite,
-              // não precisa progredir 2x; mantém o mesmo callback
               onProgress: (info) => {
                 if (!cancelled) setProgress(info);
               },
             }),
           ]);
+        } catch (err: any) {
+          if (cancelled) return;
+
+          const msg =
+            err?.status === 429
+              ? "A API do ComexStat limitou o volume de requisições (429). O app vai precisar de mais tempo entre chamadas — tente novamente em 1-2 minutos."
+              : `Erro ao consultar o ComexStat: ${err?.message || String(err)}`;
+
+          setWarning(msg);
+          setLoadingStage("erro");
+          setIsLoading(false);
+          return;
+        }
 
         if (cancelled) return;
 
