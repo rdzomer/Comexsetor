@@ -718,6 +718,7 @@ export async function fetchComexYearByNcmList(args: {
    */
   onProgress?: (info: { done: number; total: number; chunk: number; chunks: number }) => void;
 }): Promise<NcmYearRow[]> {
+  /*
   const year = args.year;
   const flow = args.flow;
   const lite = !!args.lite;
@@ -791,9 +792,7 @@ export async function fetchComexYearByNcmList(args: {
       metricFOB: 0,
       metricKG: 0,
     } as any;
-  });
-}
-): Promise<NcmYearRow[]> {
+  */
   const year = Number(args.year);
 
   const ncms8 = (args.ncms ?? [])

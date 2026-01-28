@@ -528,9 +528,15 @@ function mergeImpExpTrees(importTree: any[], exportTree: any[]) {
 }
 
 export default function CgimAnalyticsPage() {
-  const [entity, setEntity] = React.useState<string>("IABR");
+  const [entity, setEntity] = React.useState<string>("");
   const [year, setYear] = React.useState<number>(2024);
   const [flow, setFlow] = React.useState<FlowType>("import");
+
+  // ✅ Gating: não dispara chamadas até o usuário iniciar deliberadamente
+  const [cgimActive, setCgimActive] = React.useState<boolean>(false);
+
+  // ✅ Gating separado para gráficos (evita tempestade de requests / 429)
+  const [chartsActive, setChartsActive] = React.useState<boolean>(false);
 
   const [detailLevel, setDetailLevel] =
     React.useState<DetailLevel>("SUBCATEGORY");
@@ -569,6 +575,8 @@ export default function CgimAnalyticsPage() {
     "ABAL",
     "IBÁ",
   ]);
+
+  const entitiesUi = React.useMemo(() => ["", ...entities.filter(Boolean)], [entities]);
   const years = React.useMemo(() => [2022, 2023, 2024, 2025], []);
 
   const [viewMode, setViewMode] = React.useState<ViewMode>("BOTH");
@@ -621,8 +629,10 @@ export default function CgimAnalyticsPage() {
         if (cancelled) return;
         const list = (pack.entities ?? []).filter(Boolean);
         if (list.length) {
+          // Mantém lista para o select, mas NÃO auto-seleciona entidade.
           setEntities(list);
-          if (!list.includes(entity)) setEntity(list[0]);
+          // Se a entidade atual não existir mais (ex.: dicionário mudou), volta para "sem seleção".
+          if (entity && !list.includes(entity)) setEntity("");
         }
       } catch {
         // ignore
@@ -641,6 +651,8 @@ export default function CgimAnalyticsPage() {
 
     async function run() {
       const tableKey = `${entity}|${year}|${flow}`;
+      // ✅ Não faz fetch até usuário ativar e selecionar entidade
+      if (!cgimActive || !entity) return;
       if (inFlightTableKeyRef.current === tableKey) return;
       inFlightTableKeyRef.current = tableKey;
 
@@ -653,7 +665,7 @@ export default function CgimAnalyticsPage() {
 
         setLoading(true);
         // Mostra barra imediatamente (independente do callback de progresso)
-        setProgress({ done: 0, total: Math.max(1, ncmsAllUnique.length * 2) });
+        setProgress({ done: 0, total: 1 }); // total real definido após ler dicionário
 
       try {
         const dictEntries = await loadDictionary(entity);
@@ -736,17 +748,17 @@ export default function CgimAnalyticsPage() {
         const useLite = true;
 
         // força a barra a aparecer imediatamente
-    setLoading(true);
+        // loading já está true aqui; mantido apenas por clareza
     setError(null);
-    setProgress({ current: 0, total: ncmsAllUnique.length });
+        setProgress({ done: 0, total: Math.max(1, ncmsAllUnique.length * 2) });
 
     // Busca Comex (ano cheio) para TODOS os NCMs únicos com chunking (bem menos requests)
     const importRaw = await fetchComexYearByNcmList({
       year: String(year),
       flow: "import",
       ncms: ncmsAllUnique,
-      lite: isLite,
-      onProgress: ({ done, total }) => setProgress({ current: done, total }),
+      lite: useLite,
+      onProgress: ({ done }) => setProgress({ done, total: Math.max(1, ncmsAllUnique.length * 2) }),
     });
 
     if (cancelled) return;
@@ -755,27 +767,25 @@ export default function CgimAnalyticsPage() {
       year: String(year),
       flow: "export",
       ncms: ncmsAllUnique,
-      lite: isLite,
+      lite: useLite,
+      onProgress: ({ done, total }) => setProgress({ done: done + ncmsAllUnique.length, total: ncmsAllUnique.length * 2 }),
     });
 
     if (cancelled) return;
 
     const basketImportRows = importRaw.map((r: any) => ({
-      ncm: String(r.noNcmpt ?? "").replace(/\D/g, ""),
-      metricFOB: Number(r.metricFOB) || 0,
-      metricKG: Number(r.metricKG) || 0,
+      ncm: String(r.ncm ?? r.noNcmpt ?? r.coNcm ?? "").replace(/\D/g, ""),
+      fob: Number(r.fob ?? r.metricFOB ?? r.vlFob ?? 0) || 0,
+      kg: Number(r.kg ?? r.metricKG ?? r.kgLiquido ?? 0) || 0,
     }));
 
     const basketExportRows = exportRaw.map((r: any) => ({
-      ncm: String(r.noNcmpt ?? "").replace(/\D/g, ""),
-      metricFOB: Number(r.metricFOB) || 0,
-      metricKG: Number(r.metricKG) || 0,
+      ncm: String(r.ncm ?? r.noNcmpt ?? r.coNcm ?? "").replace(/\D/g, ""),
+      fob: Number(r.fob ?? r.metricFOB ?? r.vlFob ?? 0) || 0,
+      kg: Number(r.kg ?? r.metricKG ?? r.kgLiquido ?? 0) || 0,
     }));
 
-
-        if (cancelled) return;
-
-        const comexRowsImport = basketImportRows.map((r) => ({
+    const comexRowsImport = basketImportRows.map((r) => ({
           ncm: r.ncm,
           metricFOB: r.fob,
           metricKG: r.kg,
@@ -792,7 +802,7 @@ export default function CgimAnalyticsPage() {
 
         const comexZeroRows = comexRows.filter(
           (r) =>
-            (Number(r.metricFOB) || 0) === 0 && (Number(r.metricKG) || 0) === 0
+            (Number(r.fob ?? r.metricFOB ?? 0) || 0) === 0 && (Number(r.kg ?? r.metricKG ?? 0) || 0) === 0
         ).length;
 
         const apiLikelyDown =
@@ -842,7 +852,7 @@ export default function CgimAnalyticsPage() {
         setError(e?.message ? String(e.message) : "Erro ao carregar dados.");
       } finally {
         // libera lock de fetch
-        inFlightTableKeyRef.current = null;
+        if (!cancelled) inFlightTableKeyRef.current = null;
         if (!cancelled) {
           setLoading(false);
           setProgress(null);
@@ -855,7 +865,7 @@ export default function CgimAnalyticsPage() {
       cancelled = true;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [entity, year, flow, subcatDepth]);
+  }, [cgimActive, entity, year, flow, subcatDepth]);
 
   const availableCategories = React.useMemo(() => listCategories(tree), [tree]);
   const availableSubcategories = React.useMemo(
@@ -872,6 +882,8 @@ export default function CgimAnalyticsPage() {
 
     async function runCharts() {
       const chartsKey = `${entity}|${year}|${flow}|${selectedCategories.join(",")}|${selectedSubcategories.join(",")}`;
+      // ✅ Não faz fetch até usuário ativar e selecionar entidade
+      if (!cgimActive || !entity || !chartsActive) return;
       if (inFlightChartsKeyRef.current === chartsKey) return;
       inFlightChartsKeyRef.current = chartsKey;
 
@@ -903,8 +915,8 @@ export default function CgimAnalyticsPage() {
           return;
         }
 
-        const yearStart = 2010;
-        const yearEnd = 2025;
+        const yearStart = Math.max(2010, year - 10);
+        const yearEnd = year;
 
         // ✅ Padrão NCM: séries anuais separadas para Importação e Exportação
         const [impSeriesRaw, expSeriesRaw] = await Promise.all([
@@ -1030,7 +1042,7 @@ export default function CgimAnalyticsPage() {
         );
       } finally {
         // libera lock de fetch dos gráficos
-        inFlightChartsKeyRef.current = null;
+        if (!cancelled) inFlightChartsKeyRef.current = null;
         if (!cancelled) setChartsLoading(false);
       }
     }
@@ -1040,7 +1052,7 @@ export default function CgimAnalyticsPage() {
       cancelled = true;
       if (t) clearTimeout(t);
     };
-  }, [dictRowsAll, selectedCategories, selectedSubcategories, flow, tree]);
+  }, [cgimActive, chartsActive, entity, year, dictRowsAll, selectedCategories, selectedSubcategories, flow, tree]);
 
   const expandAll = React.useCallback(() => {
     const ids = new Set<string>();
@@ -1132,7 +1144,7 @@ export default function CgimAnalyticsPage() {
     const catLabel = fmtList(cats, 3);
     const subLabel = fmtList(subs, 2);
     return subs.length ? `${entity} • ${catLabel} • ${subLabel}` : `${entity} • ${catLabel}`;
-  }, [entity, selectedCategories, selectedSubcategories]);
+  }, [cgimActive, entity, selectedCategories, selectedSubcategories]);
 
   // ✅ Série derivada para a balança: importações negativas (para ficar abaixo do eixo zero)
   // (Não altera a lógica de dados — apenas a representação visual no gráfico.)
@@ -1235,6 +1247,108 @@ const compositionSubcategoryTextKg =
         </div>
       </div>
 
+
+      {/* ✅ Gating: não dispara chamadas automaticamente ao abrir o módulo CGIM */}
+      <div style={{ ...cardStyle, padding: 12 }}>
+        {!entity ? (
+          <div style={{ fontSize: 13, opacity: 0.85 }}>
+            <div style={{ fontWeight: 700, marginBottom: 4 }}>
+              Selecione a Entidade
+            </div>
+            <div>
+              Escolha uma entidade no seletor para iniciar. Nenhuma consulta à
+              API será feita até você clicar em <b>“Iniciar análise”</b>.
+            </div>
+          </div>
+        ) : !cgimActive ? (
+          <div
+            style={{
+              display: "flex",
+              justifyContent: "space-between",
+              alignItems: "center",
+              gap: 12,
+              flexWrap: "wrap",
+            }}
+          >
+            <div style={{ fontSize: 13, opacity: 0.85 }}>
+              <div style={{ fontWeight: 700, marginBottom: 4 }}>
+                Pronto para iniciar
+              </div>
+              <div>
+                Entidade selecionada: <b>{entity}</b>. Clique para carregar os
+                dados.
+              </div>
+            </div>
+            <button
+              type="button"
+              onClick={() => {
+                setChartsActive(false);
+                setCgimActive(true);
+              }}
+              style={{
+                padding: "10px 12px",
+                borderRadius: 10,
+                border: "1px solid rgba(0,0,0,0.12)",
+                background: "white",
+                cursor: "pointer",
+                fontWeight: 700,
+              }}
+            >
+              Iniciar análise
+            </button>
+          </div>
+        ) : (
+          <div
+            style={{
+              display: "flex",
+              justifyContent: "space-between",
+              alignItems: "center",
+              gap: 12,
+              flexWrap: "wrap",
+            }}
+          >
+            <div style={{ fontSize: 13, opacity: 0.85 }}>
+              Análise ativa para <b>{entity}</b>. Alterar a entidade irá pausar
+              a análise.
+            </div>
+            <button
+              type="button"
+              onClick={() => {
+                setChartsActive(false);
+                setCgimActive(false);
+              }}
+              style={{
+                padding: "10px 12px",
+                borderRadius: 10,
+                border: "1px solid rgba(0,0,0,0.12)",
+                background: "white",
+                cursor: "pointer",
+                fontWeight: 700,
+              }}
+            >
+              Pausar
+            </button>
+            <button
+              type="button"
+              onClick={() => setChartsActive(true)}
+              disabled={chartsActive}
+              title={chartsActive ? "Gráficos já carregados" : "Carregar gráficos (pode fazer várias consultas)"}
+              style={{
+                padding: "10px 12px",
+                borderRadius: 10,
+                border: "1px solid rgba(0,0,0,0.12)",
+                background: chartsActive ? "rgba(0,0,0,0.06)" : "white",
+                cursor: chartsActive ? "not-allowed" : "pointer",
+                fontWeight: 600,
+              }}
+            >
+              {chartsActive ? "Gráficos carregados" : "Carregar gráficos"}
+            </button>
+
+          </div>
+        )}
+      </div>
+
       {/* Painel de controles (extraído) */}
       {/* Painel de controles (extraído) */}
 <CgimControlsPanel
@@ -1245,7 +1359,7 @@ const compositionSubcategoryTextKg =
   multiSelectSubcatStyle={multiSelectSubcatStyle}
 
   entity={entity}
-  entities={entities}
+  entities={entitiesUi}
   onChangeEntity={(next) => {
     setSelectedCategories([]);
     setSelectedSubcategories([]);
@@ -1257,6 +1371,8 @@ const compositionSubcategoryTextKg =
     setError(null);
     setLastUpdated(null);
     setEntity(next);
+    setChartsActive(false);
+    setCgimActive(false);
   }}
 
   year={year}
@@ -1380,11 +1496,5 @@ const compositionSubcategoryTextKg =
     </div>
     </>
   );
-
-    // mapa rápido NCM -> (categoria, subcategoria)
-    const dictByNcm = new Map<string, { category: string; subcategory: string }>();
-    for (const r of dictRowsRawAll) {
-      dictByNcm.set(r.ncm, { category: r.category, subcategory: r.subcategory });
-    }
 
 }
