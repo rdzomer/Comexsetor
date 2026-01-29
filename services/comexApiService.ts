@@ -151,7 +151,7 @@ function sleep(ms: number): Promise<void> {
 // - cache curto em memória (evita refetch do mesmo payload imediatamente)
 // ==================
 const GENERAL_CONCURRENCY = 1; // ajuste mínimo; 1 = mais lento, mas quase sem 429
-const GENERAL_MIN_INTERVAL_MS = 12000; // MODO 1: espaçamento mais conservador // espaçamento mínimo entre POST /general (reduz 429; pode aumentar)
+const GENERAL_MIN_INTERVAL_MS = 20000; // MODO 1: espaçamento mais conservador // espaçamento mínimo entre POST /general (reduz 429; pode aumentar)
 let lastGeneralRequestAt = 0;
 let generalCooldownUntil = 0; // epoch ms: quando houver 429, bloqueia novas chamadas até este instante
 
@@ -829,7 +829,7 @@ export async function fetchComexYearByNcmList(args: {
   // Para evitar 429 em produção, prioriza poucos requests grandes (por lista)
   //  - lite: chunk menor (resposta mais rápida)
   //  - normal: chunk maior (menos chamadas)
-  const chunkSize = lite ? 50 : 120;
+  const chunkSize = lite ? 120 : 120;
   const chunks = Math.max(1, Math.ceil(ncms.length / chunkSize));
 
   const out: NcmYearRow[] = [];
@@ -912,7 +912,7 @@ export async function fetchComexYearByNcmList(args: {
   const chunkSize = lite ? 20 : CGIM_MAX_NCMS_PER_REQUEST;
   const maxConcurrency = lite ? 1 : CGIM_MAX_CONCURRENCY;
   const delayBetweenChunksMs = lite ? 500 : 0;
-  const retry429WaitMs = lite ? 11_000 : 0;
+  const retry429WaitMs = lite ? 60_000 : 0;
 
   const chunks = chunk(ncms8, chunkSize);
 
