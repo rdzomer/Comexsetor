@@ -564,6 +564,10 @@ export default function CgimAnalyticsPage() {
   // ✅ Evita múltiplos fetches simultâneos (React StrictMode / cliques rápidos)
   const inFlightTableKeyRef = React.useRef<string | null>(null);
   const inFlightChartsKeyRef = React.useRef<string | null>(null);
+  // PERF: trava "já executei / em execução" para impedir disparos duplicados de gráficos no mesmo contexto
+  const chartsExecutionKeyRef = React.useRef<string | null>(null);
+  // PERF: id incremental para invalidar respostas atrasadas (stale) quando contexto muda
+  const chartsRequestIdRef = React.useRef<number>(0);
 
   const [tree, setTree] = React.useState<HierarchyNode[]>([]);
   const [tableTree, setTableTree] = React.useState<any[]>([]);
@@ -598,6 +602,34 @@ export default function CgimAnalyticsPage() {
   const [subcatBars, setSubcatBars] = React.useState<any[]>([]);
   const [categoryBarsKg, setCategoryBarsKg] = React.useState<any[]>([]);
   const [subcatBarsKg, setSubcatBarsKg] = React.useState<any[]>([]);
+
+  // PERF: ao mudar entidade/ano/fluxo/filtros, limpamos estado de gráficos e invalidamos qualquer resposta atrasada
+  const resetChartsState = React.useCallback(() => {
+    chartsRequestIdRef.current += 1; // invalida respostas em voo
+    chartsExecutionKeyRef.current = null; // permite novo carregamento no mesmo contexto (após reset)
+    inFlightChartsKeyRef.current = null;
+    setChartsLoading(false);
+    setChartsError(null);
+    setAnnualSeries([]);
+    setAnnualImportSeries([]);
+    setAnnualExportSeries([]);
+    setAnnualPriceSeries([]);
+    setCategoryBars([]);
+    setSubcatBars([]);
+    setCategoryBarsKg([]);
+    setSubcatBarsKg([]);
+  }, [
+    setChartsLoading,
+    setChartsError,
+    setAnnualSeries,
+    setAnnualImportSeries,
+    setAnnualExportSeries,
+    setAnnualPriceSeries,
+    setCategoryBars,
+    setSubcatBars,
+    setCategoryBarsKg,
+    setSubcatBarsKg,
+  ]);
   const [diagnostics, setDiagnostics] = React.useState<{
     dictRows: number;
     distinctNcms: number;
@@ -626,7 +658,7 @@ export default function CgimAnalyticsPage() {
     async function loadEntitiesFromExcel() {
       try {
         const pack = await cgimDictionaryService.loadCgimDictionaryFromExcel();
-        if (cancelled) return;
+        if (cancelled || chartsRequestIdRef.current !== requestId) return;
         const list = (pack.entities ?? []).filter(Boolean);
         if (list.length) {
           // Mantém lista para o select, mas NÃO auto-seleciona entidade.
@@ -749,38 +781,31 @@ export default function CgimAnalyticsPage() {
 
         // força a barra a aparecer imediatamente
         // loading já está true aqui; mantido apenas por clareza
-    
     setError(null);
+        setProgress({ done: 0, total: Math.max(1, ncmsAllUnique.length * 2) });
 
-    // PERF: progresso deve refletir apenas o fluxo selecionado (evita "dobrar" o total).
-    const totalNcms = Math.max(1, ncmsAllUnique.length);
-    setProgress({ done: 0, total: totalNcms });
+    // Busca Comex (ano cheio) para TODOS os NCMs únicos com chunking (bem menos requests)
+    const importRaw = await fetchComexYearByNcmList({
+      year: String(year),
+      flow: "import",
+      ncms: ncmsAllUnique,
+      lite: useLite,
+      onProgress: ({ done }) => setProgress({ done, total: Math.max(1, ncmsAllUnique.length * 2) }),
+    });
 
-    // Busca Comex (ano cheio) apenas para o fluxo selecionado.
-    let importRaw: any[] = [];
-    let exportRaw: any[] = [];
+    if (cancelled || chartsRequestIdRef.current !== requestId) return;
 
-    if (flow === "import") {
-      importRaw = await fetchComexYearByNcmList({
-        year: String(year),
-        flow: "import",
-        ncms: ncmsAllUnique,
-        lite: useLite,
-        onProgress: ({ done }) => setProgress({ done, total: totalNcms }),
-      });
-    } else {
-      exportRaw = await fetchComexYearByNcmList({
-        year: String(year),
-        flow: "export",
-        ncms: ncmsAllUnique,
-        lite: useLite,
-        onProgress: ({ done }) => setProgress({ done, total: totalNcms }),
-      });
-    }
+    const exportRaw = await fetchComexYearByNcmList({
+      year: String(year),
+      flow: "export",
+      ncms: ncmsAllUnique,
+      lite: useLite,
+      onProgress: ({ done, total }) => setProgress({ done: done + ncmsAllUnique.length, total: ncmsAllUnique.length * 2 }),
+    });
 
-    if (cancelled) return;
+    if (cancelled || chartsRequestIdRef.current !== requestId) return;
 
-const basketImportRows = importRaw.map((r: any) => ({
+    const basketImportRows = importRaw.map((r: any) => ({
       ncm: String(r.ncm ?? r.noNcmpt ?? r.coNcm ?? "").replace(/\D/g, ""),
       fob: Number(r.fob ?? r.metricFOB ?? r.vlFob ?? 0) || 0,
       kg: Number(r.kg ?? r.metricKG ?? r.kgLiquido ?? 0) || 0,
@@ -855,7 +880,7 @@ const basketImportRows = importRaw.map((r: any) => ({
         setLastUpdated(new Date());
         setExpandedIds(new Set());
       } catch (e: any) {
-        if (cancelled) return;
+        if (cancelled || chartsRequestIdRef.current !== requestId) return;
         setError(e?.message ? String(e.message) : "Erro ao carregar dados.");
       } finally {
         // libera lock de fetch
@@ -888,9 +913,17 @@ const basketImportRows = importRaw.map((r: any) => ({
     let t: any = null;
 
     async function runCharts() {
-      const chartsKey = `${entity}|${year}|${flow}|${selectedCategories.join(",")}|${selectedSubcategories.join(",")}`;
+            // PERF: chave determinística (ordena arrays) para impedir disparos duplicados com o mesmo payload
+      const catsKey = [...selectedCategories].sort().join(",");
+      const subsKey = [...selectedSubcategories].sort().join(",");
+      const chartsKey = `${entity}|${year}|${flow}|${catsKey}|${subsKey}`;
+      const requestId = chartsRequestIdRef.current;
       // ✅ Não faz fetch até usuário ativar e selecionar entidade
       if (!cgimActive || !entity || !chartsActive) return;
+      // PERF: não dispara novamente para o mesmo contexto enquanto não houver reset explícito
+      if (chartsExecutionKeyRef.current === chartsKey) return;
+      chartsExecutionKeyRef.current = chartsKey;
+      // PERF: dedupe "em voo" (paralelo) para o mesmo contexto
       if (inFlightChartsKeyRef.current === chartsKey) return;
       inFlightChartsKeyRef.current = chartsKey;
 
@@ -938,7 +971,7 @@ const basketImportRows = importRaw.map((r: any) => ({
             useCache: true,
             cacheTtlHours: 24,
         });
-        if (cancelled) return;
+        if (cancelled || chartsRequestIdRef.current !== requestId) return;
         // 🕒 Espaçamento entre séries (reduz 429 em Cloudflare/ComexStat)
         await new Promise((r) => setTimeout(r, 1500));
         const expSeriesRaw = await fetchBasketAnnualSeries({
@@ -951,7 +984,7 @@ const basketImportRows = importRaw.map((r: any) => ({
             cacheTtlHours: 24,
         });
 
-        if (cancelled) return;
+        if (cancelled || chartsRequestIdRef.current !== requestId) return;
 
         const impSeries = impSeriesRaw.map((p) => ({
           name: String(p.year),
@@ -1047,10 +1080,13 @@ const basketImportRows = importRaw.map((r: any) => ({
         subsKg.sort((a, b) => (b.kg || 0) - (a.kg || 0));
         setSubcatBarsKg(subsKg.slice(0, 25));
       } catch (e: any) {
-        if (cancelled) return;
+        if (cancelled || chartsRequestIdRef.current !== requestId) return;
         setChartsError(
           e?.message ? String(e.message) : "Erro ao carregar gráficos."
         );
+        // PERF: em caso de erro, libera re-tentativa no mesmo contexto
+        chartsExecutionKeyRef.current = null;
+        setChartsActive(false);
       } finally {
         // libera lock de fetch dos gráficos
         if (!cancelled) inFlightChartsKeyRef.current = null;
@@ -1294,6 +1330,7 @@ const compositionSubcategoryTextKg =
               type="button"
               onClick={() => {
                 setChartsActive(false);
+                resetChartsState();
                 setCgimActive(true);
               }}
               style={{
@@ -1341,7 +1378,11 @@ const compositionSubcategoryTextKg =
             </button>
             <button
               type="button"
-              onClick={() => setChartsActive(true)}
+              onClick={() => {
+                // PERF: permite disparar uma nova carga de gráficos (mesmo contexto) ao clicar novamente após reset/erro
+                resetChartsState();
+                setChartsActive(true);
+              }}
               disabled={chartsActive}
               title={chartsActive ? "Gráficos já carregados" : "Carregar gráficos (pode fazer várias consultas)"}
               style={{
@@ -1383,15 +1424,26 @@ const compositionSubcategoryTextKg =
     setLastUpdated(null);
     setEntity(next);
     setChartsActive(false);
+    resetChartsState();
     setCgimActive(false);
   }}
 
   year={year}
   years={years}
-  onChangeYear={(next) => setYear(next)}
+  onChangeYear={(next) => {
+    setYear(next);
+    setChartsActive(false);
+    resetChartsState();
+    setCgimActive(false);
+  }}
 
   flow={flow}
-  onChangeFlow={(next) => setFlow(next)}
+  onChangeFlow={(next) => {
+    setFlow(next);
+    setChartsActive(false);
+    resetChartsState();
+    setCgimActive(false);
+  }}
 
   viewMode={viewMode}
   onChangeViewMode={(next) => setViewMode(next)}
