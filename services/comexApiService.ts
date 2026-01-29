@@ -901,10 +901,12 @@ export async function fetchComexYearByNcmList(args: {
   // ---- execução com limite de concorrência ----
   const lite = Boolean(args.lite);
 
-  const chunkSize = lite ? 20 : CGIM_MAX_NCMS_PER_REQUEST;
+  const chunkSize = lite ? 80 : CGIM_MAX_NCMS_PER_REQUEST;
   const maxConcurrency = lite ? 1 : CGIM_MAX_CONCURRENCY;
-  const delayBetweenChunksMs = lite ? 500 : 0;
-  const retry429WaitMs = lite ? 11_000 : 0;
+  // Em produção (Netlify), preferimos MENOS requests (chunks maiores) + pacing explícito
+  const delayBetweenChunksMs = lite ? 900 : 0;
+  // Backoff mais conservador em 429
+  const retry429WaitMs = lite ? 15_000 : 0;
 
   const chunks = chunk(ncms8, chunkSize);
 
