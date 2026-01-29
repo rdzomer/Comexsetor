@@ -1,1129 +1,1606 @@
-// services/comexApiService.ts
-// ✅ CONTRATO LEGADO do App.tsx + ✅ export extra para o CGIM (fetchComexYearByNcm)
-// Não remova exports daqui enquanto App.tsx depender deles.
+// components/CgimAnalyticsPage.tsx
+import React from "react";
+import Section from "./Section";
+import CgimStickyLoader from "./cgim/CgimStickyLoader";
+import CgimControlsPanel from "./cgim/CgimControlsPanel";
+import CgimAnnualChartsPanel from "./cgim/CgimAnnualChartsPanel";
+import SimpleLineChart from "./charts/SimpleLineChart";
+import CompositionDonutChart from "./charts/CompositionDonutChart";
+import {
+  ResponsiveContainer,
+  BarChart,
+  Bar,
+  LineChart,
+  Line,
+  CartesianGrid,
+  XAxis,
+  YAxis,
+  Tooltip,
+  Legend,
+  ReferenceLine,
+  ComposedChart,
+} from "recharts";
 
-import type { NcmYearValue } from "../utils/cgimTypes";
+import {
+  buildHierarchyTree,
+  computeTotal,
+  listCategories,
+  listSubcategories,
+  type DetailLevel,
+  type HierarchyNode,
+  type DictionaryRow,
+} from "../utils/cgimAggregation";
 
-export type TradeFlowUi = "import" | "export"; // usado pelo App
-export type TradeFlow = "imp" | "exp"; // usado pelo CGIM
+import * as cgimDictionaryService from "../services/cgimDictionaryService";
+import { fetchComexYearByNcmList } from "../services/comexApiService";
+import { fetchBasketAnnualSeries } from "../services/cgimBasketTimeseriesService";
 
-// ✅ (NOVO) Linha anual por NCM (para retorno em lote do CGIM)
-export type NcmYearRow = { ncm: string; fob: number; kg: number };
+type SortKey = "fob" | "kg";
+type SortDir = "asc" | "desc";
+type FlowType = "import" | "export";
+type ViewMode = "TABLE" | "CHARTS" | "BOTH";
 
-export interface LastUpdateData {
-  year: number;
-  month: number;
+// =====================
+// CGIM TEST MODE (controlado)
+// 1 = Mínimo Absoluto (apenas IMPORT + Tabela do ano)
+// 2 = Mínimo Recomendado
+// 3 = Mínimo Completo
+// =====================
+const CGIM_TEST_MODE: 1 | 2 | 3 = 1;
+
+
+function formatMoneyUS(v: number): string {
+  return new Intl.NumberFormat("pt-BR", { maximumFractionDigits: 0 }).format(v);
+}
+function formatKg(v: number): string {
+  return new Intl.NumberFormat("pt-BR", { maximumFractionDigits: 0 }).format(v);
+}
+function formatUsdPerTonTable(v: number): string {
+  return new Intl.NumberFormat("pt-BR", { maximumFractionDigits: 0 }).format(v);
 }
 
-export interface Period {
-  from: string; // "YYYY-MM"
-  to: string;   // "YYYY-MM"
+function normalizeNcm(v: any): string {
+  const s = String(v ?? "").replace(/\D/g, "");
+  return s.padStart(8, "0").slice(0, 8);
 }
 
-export interface ApiFilter {
-  filter: "ncm" | string;
-  values: string[];
-}
-
-export type ComexStatRecord = any;
-export type MonthlyComexStatRecord = any;
-
-export interface CountryDataRecord {
-  country: string;
-  metricFOB: number;
-  metricKG: number;
-  representatividadeFOB?: number;
-  representatividadeKG?: number;
-}
-
-// ===== CONFIG =====
-// ✅ API correta (Swagger / produção): POST https://api-comexstat.mdic.gov.br/general
-// ✅ Querystring tipicamente só para language (opcional). Aqui fixamos language=pt para consistência.
-// 🚫 Não usar http:// (Mixed Content) e 🚫 não usar host sem hífen (ERR_NAME_NOT_RESOLVED).
-const GENERAL_ENDPOINT = "https://api-comexstat.mdic.gov.br/general?language=pt";
-
-// Endpoint de atualização mudou na API nova. Mantemos múltiplas tentativas.
-const LAST_UPDATE_ENDPOINTS = [
-  // API nova
-  "https://api-comexstat.mdic.gov.br/general/dates/updated",
-
-  // API legada / variações (mantido como fallback)
-  "https://api.comexstat.mdic.gov.br/general/lastUpdate",
-  "https://api.comexstat.mdic.gov.br/general/lastupdate",
-  "https://api.comexstat.mdic.gov.br/general/last-update",
-];
-
-// ===== CGIM - limite de volume =====
-// Ajustes “empíricos” (mínimos) para reduzir bloqueios:
-// - chunk menor reduz payload por request
-// - concorrência baixa reduz tempestade de requests
-const CGIM_MAX_NCMS_PER_REQUEST = 60; // comece com 40–80; 60 costuma ser bom
-const CGIM_MAX_CONCURRENCY = 3;       // 2–4 conforme sua meta (aqui: 3)
-const DEFAULT_TIMEOUT_MS = 45_000;
-
-// ===== HELPERS =====
-
-function toApiTypeFormFromUi(flow: TradeFlowUi): number {
-  return flow === "export" ? 1 : 2;
-}
-
-function toApiTypeForm(flow: TradeFlow): number {
-  return flow === "exp" ? 1 : 2;
-}
-
-function parseYearMonth(s: string): { year: number; month: number } | null {
-  const m = /^(\d{4})-(\d{2})$/.exec(String(s || "").trim());
-  if (!m) return null;
-  const year = Number(m[1]);
-  const month = Number(m[2]);
-  if (!Number.isFinite(year) || !Number.isFinite(month)) return null;
-  return { year, month };
-}
-
-function periodToYears(period: Period): { yearStart: number; yearEnd: number; monthStart: string; monthEnd: string } {
-  const from = parseYearMonth(period.from);
-  const to = parseYearMonth(period.to);
-  const now = new Date();
-  const fallback = { year: now.getFullYear(), month: now.getMonth() + 1 };
-
-  const f = from ?? fallback;
-  const t = to ?? fallback;
-
-  return {
-    yearStart: f.year,
-    yearEnd: t.year,
-    monthStart: String(f.month).padStart(2, "0"),
-    monthEnd: String(t.month).padStart(2, "0"),
-  };
-}
-
-function buildMetricsFlags(metrics: string[]) {
-  const set = new Set(metrics || []);
-  return {
-    metricFOB: set.has("metricFOB"),
-    metricKG: set.has("metricKG"),
-    metricStatistic: set.has("metricStatistic"),
-    metricCIF: set.has("metricCIF"),
-    metricFreight: set.has("metricFreight"),
-    metricInsurance: set.has("metricInsurance"),
-  };
-}
-
-function normalizeNcmDigits(raw: unknown): string {
-  return String(raw ?? "").replace(/\D/g, "");
-}
-
-// ✅ Para CGIM: NCM canônica de 8 dígitos ou null
-export function normalizeNcmTo8(raw: unknown): string | null {
-  const digits = normalizeNcmDigits(raw);
-  if (digits.length !== 8) return null;
-  return digits;
-}
-
-// Para App: não forçamos 8, pois ele pode aceitar hierarquia; mas em geral o usuário usa 8
-function normalizeNcmLoose(raw: unknown): string {
-  return normalizeNcmDigits(raw);
-}
-
-async function fetchWithTimeout(url: string, timeoutMs: number, init?: RequestInit): Promise<Response> {
-  const controller = new AbortController();
-  const t = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    return await fetch(url, { ...(init ?? {}), signal: controller.signal });
-  } finally {
-    clearTimeout(t);
+function pickFn<T extends Function>(obj: any, names: string[]): T {
+  for (const n of names) {
+    const fn = obj?.[n];
+    if (typeof fn === "function") return fn as T;
   }
-}
-
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-
-
-
-
-// ==================
-// ✅ AÇÃO MÍNIMA: proteção contra 429 e repetição de chamadas
-// - limita concorrência de /general (evita "rajadas" que estouram rate limit)
-// - deduplica chamadas idênticas em voo (rerender/efeito duplicado não duplica request)
-// - cache curto em memória (evita refetch do mesmo payload imediatamente)
-// ==================
-const GENERAL_CONCURRENCY = 1; // ajuste mínimo; 1 = mais lento, mas quase sem 429
-const GENERAL_MIN_INTERVAL_MS = 3500; // espaçamento mínimo entre POST /general (reduz 429; pode aumentar)
-let lastGeneralRequestAt = 0;
-let generalActive = 0;
-const generalQueue: Array<() => void> = [];
-
-async function withGeneralSlot<T>(fn: () => Promise<T>): Promise<T> {
-  if (generalActive >= GENERAL_CONCURRENCY) {
-    await new Promise<void>((resolve) => generalQueue.push(resolve));
-  }
-  generalActive++;
-  // 🔧 AÇÃO MÍNIMA: espaça requisições /general para reduzir 429 (API pede ~10s em caso de limite)
-  const now = Date.now();
-  const diff = now - lastGeneralRequestAt;
-  if (diff >= 0 && diff < GENERAL_MIN_INTERVAL_MS) {
-    await sleep(GENERAL_MIN_INTERVAL_MS - diff);
-  }
-  lastGeneralRequestAt = Date.now();
-  try {
-    return await fn();
-  } finally {
-    generalActive--;
-    const next = generalQueue.shift();
-    if (next) next();
-  }
-}
-
-const GENERAL_CACHE_TTL_MS = 2 * 60 * 1000; // 2 min
-const generalCache = new Map<string, { ts: number; value: any }>();
-const generalInFlight = new Map<string, Promise<any>>();
-
-function makeGeneralKey(url: string, body: any): string {
-  // JSON stringify é suficiente aqui porque o body é determinístico (mesma ordem de arrays)
-  return `${url}::${JSON.stringify(body)}`;
-}
-/**
- * 🔧 AÇÃO MÍNIMA (auditoria):
- * Corrige payload legado quando alguém usa "noNcmpt" como filtro (errado) passando código NCM.
- * - noNcmpt é campo textual (descrição), não filtro de código.
- * - para código NCM o id correto no legado é "coNcm".
- *
- * Isso evita 400 quando, por algum caminho, ainda sai:
- *   filterList: [{id:"noNcmpt"}]
- *   filterArray: [{idInput:"noNcmpt", item:["87087090"]}]
- */
-function sanitizeLegacyNcmFilterIds(p: any) {
-  if (!p || typeof p !== "object") return p;
-
-  const fl = Array.isArray(p.filterList) ? p.filterList : null;
-  const fa = Array.isArray(p.filterArray) ? p.filterArray : null;
-  if (!fl || !fa) return p;
-
-  // detecta se "noNcmpt" está sendo usado com itens que parecem NCM (8 dígitos)
-  const hasNoNcmptAsFilter = fl.some((x: any) => x?.id === "noNcmpt") || fa.some((x: any) => x?.idInput === "noNcmpt");
-  if (!hasNoNcmptAsFilter) return p;
-
-  const looksLikeNcmCode = (v: any) => {
-    const d = normalizeNcmDigits(v);
-    return d.length === 8;
-  };
-
-  const arrayHasNcmCodes = fa.some((x: any) => Array.isArray(x?.item) && x.item.some(looksLikeNcmCode));
-  if (!arrayHasNcmCodes) return p;
-
-  // troca ids errados para o correto do legado
-  p.filterList = fl.map((x: any) => (x?.id === "noNcmpt" ? { ...x, id: "coNcm" } : x));
-  p.filterArray = fa.map((x: any) => (x?.idInput === "noNcmpt" ? { ...x, idInput: "coNcm" } : x));
-  return p;
-}
-
-/**
- * ✅ Converte payload legado (do App antigo) para o body novo do /general (Swagger).
- * Cobre o que é usado hoje: NCM e "country".
- */
-function legacyToNewGeneralBody(p: any) {
-  const flow = Number(p?.typeForm) === 1 ? "export" : "import";
-
-  const yearStart = String(p?.yearStart ?? "");
-  const yearEnd = String(p?.yearEnd ?? "");
-  const monthStart = String(p?.monthStart ?? "01").padStart(2, "0");
-  const monthEnd = String(p?.monthEnd ?? "12").padStart(2, "0");
-
-  const period = {
-    from: `${yearStart}-${monthStart}`,
-    to: `${yearEnd}-${monthEnd}`,
-  };
-
-  // metrics
-  const metrics: string[] = [];
-  for (const k of ["metricFOB", "metricKG", "metricStatistic", "metricFreight", "metricInsurance", "metricCIF"]) {
-    if (p?.[k] === true) metrics.push(k);
-  }
-
-  // filters: NCM (aceita legado "coNcm" e também corrige "noNcmpt" se vier errado)
-  const filters: Array<{ filter: string; values: any[] }> = [];
-  const fa = Array.isArray(p?.filterArray) ? p.filterArray : [];
-
-  for (const f of fa) {
-    const id = f?.idInput;
-
-    // ✅ id correto legado para código NCM
-    if (id === "coNcm") {
-      filters.push({ filter: "ncm", values: Array.isArray(f.item) ? f.item : [] });
-      continue;
-    }
-
-    // 🔧 compat: alguns caminhos antigos mandam "noNcmpt" errado com código
-    if (id === "noNcmpt") {
-      filters.push({ filter: "ncm", values: Array.isArray(f.item) ? f.item : [] });
-      continue;
-    }
-  }
-
-  // details: mapear seus ids legados -> names novos
-  const details: string[] = [];
-  const dd = Array.isArray(p?.detailDatabase) ? p.detailDatabase : [];
-  for (const d of dd) {
-    const id = d?.id;
-    if (id === "noNcmpt" && !details.includes("ncm")) details.push("ncm");
-    if (
-      (id === "noPais" ||
-        id === "noPaisOrigem" ||
-        id === "noPaisDestino" ||
-        id === "coPais" ||
-        id === "coPaisOrigem" ||
-        id === "coPaisDestino") &&
-      !details.includes("country")
-    ) {
-      details.push("country");
-    }
-  }
-
-  return {
-    flow,
-    monthDetail: Boolean(p?.monthDetail),
-    period,
-    filters,
-    details: details.length ? details : ["ncm"],
-    metrics: metrics.length ? metrics : ["metricFOB", "metricKG"],
-  };
-}
-
-/**
- * Extrai as linhas do retorno do Comex Stat.
- *
- * A API antiga (legada) retornava um array "cru" no formato: [[rows], meta...]
- * A API nova (api-comexstat) retorna um envelope: { data: { list: [...] }, success: true, ... }
- *   e/ou algumas variações: { data: [[rows], ...], ... }
- *
- * Se este parser falhar, o CGIM zera tudo (porque acha que "não veio nada").
- */
-function extractRows(json: any): any[] {
-  // ✅ Formato comum na API nova: { data: { list: [...] } }
-  const list =
-    json?.data?.list ??
-    json?.Data?.list ??
-    json?.result?.list ??
-    json?.resultado?.list;
-
-  // ✅ (AJUSTE) Às vezes o "list" vem como array legado dentro (list[0][0])
-  if (Array.isArray(list)) {
-    // list pode ser: [ [rows], meta ]  OU  rows direto
-    const maybe = list?.[0]?.[0];
-    if (Array.isArray(maybe)) return maybe;
-
-    const maybe2 = list?.[0];
-    if (Array.isArray(maybe2) && (maybe2.length === 0 || typeof maybe2[0] === "object")) return maybe2;
-
-    if (list.length === 0) return list;
-    if (list.length > 0 && typeof list[0] === "object" && !Array.isArray(list[0])) return list;
-  }
-
-  const tryArrayShape = (root: any): any[] => {
-    if (!Array.isArray(root)) return [];
-
-    const a = root?.[0]?.[0];
-    if (Array.isArray(a)) return a;
-
-    const b = root?.[0];
-    if (Array.isArray(b) && (b.length === 0 || typeof b[0] === "object")) return b;
-
-    if (root.length === 0) return root;
-    if (root.length > 0 && typeof root[0] === "object" && !Array.isArray(root[0])) return root;
-
-    return [];
-  };
-
-  // 1) formato antigo (array raiz)
-  const fromArrayRoot = tryArrayShape(json);
-  if (fromArrayRoot.length) return fromArrayRoot;
-
-  // 2) formato novo (envelope com data como array)
-  const data = json?.data ?? json?.Data ?? json?.result ?? json?.resultado;
-  const fromData = tryArrayShape(data);
-  if (fromData.length) return fromData;
-
-  // ✅ (AJUSTE) alguns endpoints aninham data.data
-  const data2 = data?.data ?? data?.Data ?? data?.result ?? data?.resultado;
-  const fromData2 = tryArrayShape(data2);
-  if (fromData2.length) return fromData2;
-
-  // 3) alguns endpoints podem aninhar mais um nível
-  const deep = json?.data?.data ?? json?.data?.rows ?? json?.rows;
-  const fromDeep = tryArrayShape(deep);
-  if (fromDeep.length) return fromDeep;
-
-  // ✅ (AJUSTE) variações: data.list dentro de data.data
-  const deepList = json?.data?.data?.list ?? json?.data?.result?.list ?? json?.data?.resultado?.list;
-  const fromDeepList = tryArrayShape(deepList);
-  if (fromDeepList.length) return fromDeepList;
-
-  return [];
-}
-
-function coerceNumber(v: any): number {
-  const n = Number(v);
-  return Number.isFinite(n) ? n : 0;
-}
-
-function parseGeneralResponseToValue(json: any): NcmYearValue {
-  const rows = extractRows(json);
-  if (!rows.length) return { fob: 0, kg: 0 };
-  const row = rows[0];
-
-  const fob = coerceNumber(
-    row?.metricFOB ??
-      row?.vlFob ??
-      row?.vl_fob ??
-      row?.fob ??
-      row?.valorFOB ??
-      row?.vlFOB
+  throw new Error(
+    `Não encontrei função no cgimDictionaryService. Exporte uma destas: ${names.join(
+      ", "
+    )}`
   );
-
-  const kg = coerceNumber(
-    row?.metricKG ??
-      row?.kgLiquido ??
-      row?.kg_liquido ??
-      row?.kg ??
-      row?.pesoLiquido ??
-      row?.kgLiqu
-  );
-
-  return { fob, kg };
 }
 
-// ====== ✅ NOVO CORE: /general via POST + body (Swagger) ======
-type ComexGeneralMeta = {
-  ok: boolean;
-  status: number;
-  statusText: string;
-  rows: any[];
-  errorText?: string;
+function truncateLabel(s: string, max = 70) {
+  const t = String(s ?? "");
+  return t.length > max ? t.slice(0, max - 1) + "…" : t;
+}
+
+function isEmptySubValue(v: unknown): boolean {
+  if (v === null || v === undefined) return true;
+  if (typeof v === "number") return v === 0;
+  const s = String(v).trim();
+  return s === "" || s === "0";
+}
+
+function buildSubcategoryLabel(
+  subs: Array<string | null>,
+  depth: number
+): string | null {
+  const parts = subs
+    .slice(0, depth)
+    .map((s) => (isEmptySubValue(s) ? "" : String(s ?? "").trim()))
+    .filter(Boolean);
+
+  if (!parts.length) return null;
+  return parts.join(" > ");
+}
+
+// ✅ Cesta dos gráficos a partir do dicionário (não depende da árvore do ano)
+function collectNcmsFromDictionary(args: {
+  dictRowsAll: DictionaryRow[];
+  selectedCategories: string[];
+  selectedSubcategories: string[];
+}): string[] {
+  const { dictRowsAll, selectedCategories, selectedSubcategories } = args;
+  const catSet = new Set((selectedCategories || []).filter(Boolean));
+  const subSet = new Set((selectedSubcategories || []).filter(Boolean));
+
+  const out = new Set<string>();
+
+  for (const r of dictRowsAll || []) {
+    if (catSet.size && !catSet.has(r.categoria)) continue;
+    const sub = r.subcategoria || "Sem subcategoria";
+    if (subSet.size && !subSet.has(sub)) continue;
+
+    const n = normalizeNcm(r.ncm);
+    if (n) out.add(n);
+  }
+
+  return Array.from(out);
+}
+
+
+/* ======================================================================================
+   CGIM — TABELA HIERÁRQUICA (INLINE)
+   Escopo: apenas EXIBIÇÃO da tabela (sem mexer em API/services/cálculos).
+   Mantém: hierarquia, colunas fixas à esquerda, rolagem horizontal, cores saldo +/-
+   Adiciona colunas: EXP (FOB/KG), IMP (FOB/KG), BALANÇA (FOB/KG), PM IMP/EXP (US$/t)
+====================================================================================== */
+
+type TableSortKey = "fob" | "kg";
+type TableSortDir = "asc" | "desc";
+
+type CgimHierarchyTableProps = {
+  tree: any[]; // HierarchyNode[] (mantido como any para evitar refatorações / dependências circulares)
+  detailLevel: any; // DetailLevel
+  selectedCategories: string[];
+  selectedSubcategories: string[];
+  expandedIds: Set<string>;
+  onToggleExpand: (id: string) => void;
+  sortKey: TableSortKey;
+  sortDir: TableSortDir;
+  onChangeSort: (k: TableSortKey) => void;
+  formatFOB: (v: number) => string;
+  formatKG: (v: number) => string;
+  formatUsdPerTon?: (v: number) => string;
 };
 
-async function comexGeneralRequestWithMeta(payload: any, timeoutMs = DEFAULT_TIMEOUT_MS): Promise<ComexGeneralMeta> {
-  try {
-    const url = GENERAL_ENDPOINT;
+function pickNumber(obj: any, keys: string[]): number | undefined {
+  if (!obj) return undefined;
+  for (const k of keys) {
+    const v = obj?.[k];
+    if (typeof v === "number" && !Number.isNaN(v)) return v;
+  }
+  return undefined;
+}
 
-    // 🔧 AÇÃO MÍNIMA: garantir que, se vier "noNcmpt" como filtro legado, vira "coNcm"
-    const sanitized = sanitizeLegacyNcmFilterIds(payload);
 
-    // ✅ Se já vier no formato novo, usa direto
-    const isNewShape =
-      sanitized &&
-      typeof sanitized.flow === "string" &&
-      sanitized.period &&
-      Array.isArray(sanitized.metrics);
+function balanceStyle(v?: number): React.CSSProperties {
+  if (v === null || v === undefined || Number.isNaN(v)) return {};
+  if (v > 0) return { color: "#0E7A2F", fontWeight: 700 };
+  if (v < 0) return { color: "#B42318", fontWeight: 700 };
+  return { color: "#111827", fontWeight: 700 };
+}
 
-    const body = isNewShape ? sanitized : legacyToNewGeneralBody(sanitized);
+function nodeId(n: any): string {
+  return String(n?.id ?? n?.key ?? n?.code ?? n?.ncm ?? n?.name ?? Math.random());
+}
 
-    // ✅ dedupe + cache curto (evita chamadas repetidas idênticas por re-render/efeitos)
-    const key = makeGeneralKey(url, body);
-    const cached = generalCache.get(key);
-    if (cached && Date.now() - cached.ts < GENERAL_CACHE_TTL_MS) {
-      return cached.value;
+function nodeLabel(n: any): string {
+  return String(n?.label ?? n?.name ?? n?.title ?? n?.ncm ?? "—");
+}
+
+function nodeSecondary(n: any): string | undefined {
+  const d = n?.description ?? n?.desc ?? n?.secondary;
+  return typeof d === "string" ? d : undefined;
+}
+
+function nodeChildren(n: any): any[] {
+  return (n?.children ?? n?.subcategories ?? n?.items ?? []) as any[];
+}
+
+function metric(obj: any) {
+  // IMPORTANT: NÃO CALCULA dados-base; apenas lê campos já existentes.
+  // Para tabela analítica (merge), preferimos: obj.imp / obj.exp (cada um com {fob, kg})
+  const impObj = obj?.imp ?? obj?.import ?? null;
+  const expObj = obj?.exp ?? obj?.export ?? null;
+
+  const impFob = pickNumber(impObj, ["fob", "impFob", "importFob", "metricFOB", "fobImp"]) ?? pickNumber(obj?.metrics ?? obj, ["fob", "impFob", "importFob"]);
+  const impKg  = pickNumber(impObj, ["kg", "impKg", "importKg", "metricKG", "kgImp"]) ?? pickNumber(obj?.metrics ?? obj, ["kg", "impKg", "importKg"]);
+
+  const expFob = pickNumber(expObj, ["fob", "expFob", "exportFob", "metricFOB", "fobExp"]);
+  const expKg  = pickNumber(expObj, ["kg", "expKg", "exportKg", "metricKG", "kgExp"]);
+
+  // Saldo: se existir pronto, usa; senão deriva (somente exibição)
+  const balFob = pickNumber(obj, ["balanceFob", "balFob", "saldoFob", "balance_fob", "saldo_fob"]) ?? (
+    (typeof expFob === "number" && typeof impFob === "number") ? (expFob - impFob) : undefined
+  );
+  const balKg  = pickNumber(obj, ["balanceKg", "balKg", "saldoKg", "balance_kg", "saldo_kg"]) ?? (
+    (typeof expKg === "number" && typeof impKg === "number") ? (expKg - impKg) : undefined
+  );
+
+  // Preço médio (US$/t): se existir pronto, usa; senão deriva (somente exibição)
+  const pmImp = pickNumber(obj, ["avgImpUsdPerTon", "pmImpUsdPerTon", "avgImportUsdPerTon", "pmImportUsdPerTon"]);
+  const pmExp = pickNumber(obj, ["avgExpUsdPerTon", "pmExpUsdPerTon", "avgExportUsdPerTon", "pmExportUsdPerTon"]);
+
+  const pmImpDerived =
+    pmImp !== undefined ? pmImp :
+    (typeof impFob === "number" && typeof impKg === "number" && impKg > 0 ? (impFob * 1000) / impKg : undefined);
+
+  const pmExpDerived =
+    pmExp !== undefined ? pmExp :
+    (typeof expFob === "number" && typeof expKg === "number" && expKg > 0 ? (expFob * 1000) / expKg : undefined);
+
+  return { expFob, expKg, impFob, impKg, balFob, balKg, pmImp: pmImpDerived, pmExp: pmExpDerived };
+}
+
+function CgimHierarchyTable(props: CgimHierarchyTableProps) {
+  const {
+    tree,
+    expandedIds,
+    onToggleExpand,
+    sortKey,
+    sortDir,
+    onChangeSort,
+    formatFOB,
+    formatKG,
+    formatUsdPerTon,
+  } = props;
+
+  const styles: Record<string, React.CSSProperties> = {
+    wrap: {
+      border: "1px solid #E6E8EC",
+      borderRadius: 14,
+      background: "#fff",
+      overflow: "hidden",
+    },
+    tableWrap: { overflowX: "auto" },
+    table: {
+      width: "100%",
+      borderCollapse: "separate",
+      borderSpacing: 0,
+      minWidth: 1250,
+      fontSize: 13,
+    },
+    theadTh: {
+      position: "sticky",
+      top: 0,
+      zIndex: 4,
+      background: "#F9FAFB",
+      borderBottom: "1px solid #E6E8EC",
+      padding: "10px 10px",
+      textAlign: "right",
+      fontWeight: 800,
+      whiteSpace: "nowrap",
+    },
+    theadThLeft: {
+      position: "sticky",
+      top: 0,
+      left: 0,
+      zIndex: 6,
+      background: "#F9FAFB",
+      borderBottom: "1px solid #E6E8EC",
+      padding: "10px 10px",
+      textAlign: "left",
+      fontWeight: 800,
+      whiteSpace: "nowrap",
+    },
+    groupHead: {
+      background: "#F9FAFB",
+      borderBottom: "1px solid #E6E8EC",
+      padding: "8px 10px",
+      textAlign: "center",
+      fontWeight: 900,
+      whiteSpace: "nowrap",
+    },
+    groupHeadLeft: {
+      position: "sticky",
+      left: 0,
+      zIndex: 6,
+      background: "#F9FAFB",
+      borderBottom: "1px solid #E6E8EC",
+      padding: "8px 10px",
+      textAlign: "left",
+      fontWeight: 900,
+      whiteSpace: "nowrap",
+    },
+    td: {
+      borderBottom: "1px solid #F1F2F4",
+      padding: "10px 10px",
+      textAlign: "right",
+      whiteSpace: "nowrap",
+      color: "#111827",
+    },
+    tdLeft: {
+      position: "sticky",
+      left: 0,
+      zIndex: 3,
+      background: "#fff",
+      borderBottom: "1px solid #F1F2F4",
+      padding: "10px 10px",
+      textAlign: "left",
+      whiteSpace: "nowrap",
+    },
+    btn: {
+      border: "1px solid #E6E8EC",
+      background: "#fff",
+      borderRadius: 10,
+      width: 24,
+      height: 24,
+      cursor: "pointer",
+      display: "inline-flex",
+      alignItems: "center",
+      justifyContent: "center",
+      marginRight: 8,
+      userSelect: "none",
+    },
+    sub: { color: "#6B7280", fontSize: 12, marginTop: 2, maxWidth: 520, overflow: "hidden", textOverflow: "ellipsis" },
+    rowCat: { fontWeight: 800 },
+    rowSub: { fontWeight: 700 },
+    rowNcm: { fontWeight: 500 },
+    sortBtn: {
+      border: "none",
+      background: "transparent",
+      cursor: "pointer",
+      padding: 0,
+      fontWeight: 800,
+      color: "#111827",
+    },
+  };
+
+  function chevron(open: boolean) {
+    return open ? "▾" : "▸";
+  }
+
+  function indent(depth: number): React.CSSProperties {
+    return { paddingLeft: 10 + depth * 18 };
+  }
+
+  function flatten(nodes: any[], depth: number, kind: "category" | "subcategory" | "ncm", acc: any[]) {
+    // Ordenação: mantém lógica original de sortKey/sortDir (aplicada no nível atual)
+    const sorted = [...nodes].sort((a, b) => {
+      const ma = metric(a);
+      const mb = metric(b);
+      const va = sortKey === "fob" ? (ma.impFob ?? 0) : (ma.impKg ?? 0);
+      const vb = sortKey === "fob" ? (mb.impFob ?? 0) : (mb.impKg ?? 0);
+      const diff = va - vb;
+      return sortDir === "asc" ? diff : -diff;
+    });
+
+    for (const n of sorted) {
+      const id = nodeId(n);
+      const kids = nodeChildren(n);
+      const open = expandedIds.has(id);
+
+      acc.push({ n, id, depth, kind, hasChildren: kids.length > 0, open });
+
+      if (kids.length > 0 && open) {
+        const nextKind = kind === "category" ? "subcategory" : kind === "subcategory" ? "ncm" : "ncm";
+        flatten(kids, depth + 1, nextKind, acc);
+      }
     }
-    const inflight = generalInFlight.get(key);
-    if (inflight) {
-      return await inflight;
+  }
+
+  const rows = React.useMemo(() => {
+    const acc: any[] = [];
+    flatten(tree ?? [], 0, "category", acc);
+    return acc;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tree, expandedIds, sortKey, sortDir]);
+
+  const sortLabel = sortKey === "fob" ? "FOB" : "KG";
+
+  return (
+    <div style={styles.wrap}>
+      <div style={{ padding: "10px 12px", borderBottom: "1px solid #E6E8EC", display: "flex", gap: 14, alignItems: "center" }}>
+        <div style={{ fontWeight: 900, color: "#111827" }}>Tabela</div>
+        <div style={{ fontSize: 12, color: "#6B7280" }}>
+          Ordenação:{" "}
+          <button style={styles.sortBtn} onClick={() => onChangeSort(sortKey)} title="Alternar direção">
+            {sortLabel} ({sortDir})
+          </button>
+          {" · "}
+          <button style={styles.sortBtn} onClick={() => onChangeSort(sortKey === "fob" ? "kg" : "fob")} title="Trocar chave de ordenação">
+            trocar para {sortKey === "fob" ? "KG" : "FOB"}
+          </button>
+        </div>
+      </div>
+
+      <div style={styles.tableWrap}>
+        <table style={styles.table}>
+          <thead>
+            <tr>
+              <th style={styles.groupHeadLeft}>Hierarquia</th>
+              <th style={styles.groupHead} colSpan={2}>EXP</th>
+              <th style={styles.groupHead} colSpan={2}>IMP</th>
+              <th style={styles.groupHead} colSpan={2}>BALANÇA</th>
+              <th style={styles.groupHead} colSpan={2}>PREÇO MÉDIO (US$/t)</th>
+            </tr>
+            <tr>
+              <th style={styles.theadThLeft}>Categoria / Subcategoria / NCM</th>
+
+              <th style={styles.theadTh} title="Exportação (US$ FOB)">EXP (US$ FOB)</th>
+              <th style={styles.theadTh} title="Exportação (KG)">EXP (KG)</th>
+
+              <th style={styles.theadTh} title="Importação (US$ FOB)">IMP (US$ FOB)</th>
+              <th style={styles.theadTh} title="Importação (KG)">IMP (KG)</th>
+
+              <th style={styles.theadTh} title="Saldo comercial (US$ FOB)">BALANÇA (FOB)</th>
+              <th style={styles.theadTh} title="Saldo comercial (KG)">BALANÇA (KG)</th>
+
+              <th style={styles.theadTh} title="Preço médio de importação (US$/t)">PM IMP (US$/t)</th>
+              <th style={styles.theadTh} title="Preço médio de exportação (US$/t)">PM EXP (US$/t)</th>
+            </tr>
+          </thead>
+
+          <tbody>
+            {rows.length === 0 ? (
+              <tr>
+                <td colSpan={9} style={{ padding: 16, color: "#6B7280" }}>Nenhum dado para exibir.</td>
+              </tr>
+            ) : (
+              rows.map((r) => {
+                const m = metric(r.n);
+
+                const label = nodeLabel(r.n);
+                const secondary = nodeSecondary(r.n);
+
+                const trStyle =
+                  r.kind === "category" ? styles.rowCat : r.kind === "subcategory" ? styles.rowSub : styles.rowNcm;
+
+                return (
+                  <tr key={r.id} style={trStyle}>
+                    <td style={{ ...styles.tdLeft, ...indent(r.depth) }}>
+                      <div style={{ display: "flex", alignItems: "flex-start", gap: 8 }}>
+                        {r.hasChildren ? (
+                          <button
+                            type="button"
+                            style={styles.btn}
+                            onClick={() => onToggleExpand(r.id)}
+                            aria-label={r.open ? "Recolher" : "Expandir"}
+                            title={r.open ? "Recolher" : "Expandir"}
+                          >
+                            {chevron(r.open)}
+                          </button>
+                        ) : (
+                          <span style={{ width: 24, display: "inline-block" }} />
+                        )}
+
+                        <div style={{ display: "flex", flexDirection: "column" }}>
+                          <span style={{ color: "#111827" }}>{label}</span>
+                          {secondary ? <span style={styles.sub} title={secondary}>{secondary}</span> : null}
+                        </div>
+                      </div>
+                    </td>
+
+                    {/* EXP */}
+                    <td style={styles.td}>{m.expFob === undefined ? "—" : formatFOB(m.expFob)}</td>
+                    <td style={styles.td}>{m.expKg === undefined ? "—" : formatKG(m.expKg)}</td>
+
+                    {/* IMP */}
+                    <td style={styles.td}>{m.impFob === undefined ? "—" : formatFOB(m.impFob)}</td>
+                    <td style={styles.td}>{m.impKg === undefined ? "—" : formatKG(m.impKg)}</td>
+
+                    {/* BALANÇA */}
+                    <td style={{ ...styles.td, ...balanceStyle(m.balFob) }}>{m.balFob === undefined ? "—" : formatFOB(m.balFob)}</td>
+                    <td style={{ ...styles.td, ...balanceStyle(m.balKg) }}>{m.balKg === undefined ? "—" : formatKG(m.balKg)}</td>
+
+                    {/* PREÇO MÉDIO */}
+                    <td style={styles.td}>{m.pmImp === undefined ? "—" : formatUsdPerTonTable(m.pmImp)}</td>
+                    <td style={styles.td}>{m.pmExp === undefined ? "—" : formatUsdPerTonTable(m.pmExp)}</td>
+                  </tr>
+                );
+              })
+            )}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+
+/* ======================================================================================
+   CGIM — MERGE DE ÁRVORES (IMPORT + EXPORT) PARA TABELA
+   - Não altera services. Apenas combina duas árvores já agregadas.
+   - A tabela passa a ler: node.imp.{fob,kg} e node.exp.{fob,kg}
+====================================================================================== */
+function indexTreeById(nodes: any[], map = new Map<string, any>()) {
+  for (const n of nodes || []) {
+    const id = String(n?.id ?? n?.key ?? n?.code ?? n?.ncm ?? n?.name);
+    map.set(id, n);
+    const kids = (n?.children ?? n?.subcategories ?? n?.items ?? []) as any[];
+    if (kids?.length) indexTreeById(kids, map);
+  }
+  return map;
+}
+
+function cloneNodeShallow(n: any) {
+  // clone raso preservando tudo (evita regressões de UI)
+  return { ...n };
+}
+
+function mergeImpExpTrees(importTree: any[], exportTree: any[]) {
+  const expIndex = indexTreeById(exportTree || []);
+  const mergeNode = (nImp: any): any => {
+    const id = String(nImp?.id ?? nImp?.key ?? nImp?.code ?? nImp?.ncm ?? nImp?.name);
+    const nExp = expIndex.get(id);
+
+    const out = cloneNodeShallow(nImp);
+
+    // Preserva metrics originais (usadas em outros lugares). Adiciona canais "imp" e "exp" para tabela.
+    out.imp = {
+      fob: nImp?.metrics?.fob ?? nImp?.fob ?? 0,
+      kg: nImp?.metrics?.kg ?? nImp?.kg ?? 0,
+    };
+
+    out.exp = {
+      fob: nExp?.metrics?.fob ?? nExp?.fob ?? 0,
+      kg: nExp?.metrics?.kg ?? nExp?.kg ?? 0,
+    };
+
+    const kidsImp = (nImp?.children ?? nImp?.subcategories ?? nImp?.items ?? []) as any[];
+    if (kidsImp?.length) {
+      out.children = kidsImp.map(mergeNode);
     }
 
-    const promise = withGeneralSlot(async () => {
-      const MAX_RETRIES_429 = 8;
+    return out;
+  };
 
-      for (let attempt = 0; attempt <= MAX_RETRIES_429; attempt++) {
-        const res = await fetchWithTimeout(url, timeoutMs, {
-          method: "POST",
-          headers: { "Content-Type": "application/json", Accept: "application/json" },
-          body: JSON.stringify(body),
+  return (importTree || []).map(mergeNode);
+}
+
+export default function CgimAnalyticsPage() {
+  const [entity, setEntity] = React.useState<string>("");
+  const [year, setYear] = React.useState<number>(2024);
+  const [flow, setFlow] = React.useState<FlowType>("import");
+
+  // ✅ Gating: não dispara chamadas até o usuário iniciar deliberadamente
+  const [cgimActive, setCgimActive] = React.useState<boolean>(false);
+
+  // ✅ Gating separado para gráficos (evita tempestade de requests / 429)
+  const [chartsActive, setChartsActive] = React.useState<boolean>(false);
+
+  const [detailLevel, setDetailLevel] =
+    React.useState<DetailLevel>("SUBCATEGORY");
+  const [subcatDepth, setSubcatDepth] = React.useState<number>(1);
+  const [maxSubcatDepth, setMaxSubcatDepth] = React.useState<number>(1);
+
+  const [sortKey, setSortKey] = React.useState<SortKey>("fob");
+  const [sortDir, setSortDir] = React.useState<SortDir>("desc");
+
+  const [expandedIds, setExpandedIds] = React.useState<Set<string>>(new Set());
+  const [selectedCategories, setSelectedCategories] = React.useState<string[]>(
+    []
+  );
+  const [selectedSubcategories, setSelectedSubcategories] = React.useState<
+    string[]
+  >([]);
+
+  const [loading, setLoading] = React.useState(false);
+  const [progress, setProgress] = React.useState<{
+    done: number;
+    total: number;
+  } | null>(null);
+  const [error, setError] = React.useState<string | null>(null);
+
+  // ✅ Evita múltiplos fetches simultâneos (React StrictMode / cliques rápidos)
+  const inFlightTableKeyRef = React.useRef<string | null>(null);
+  const inFlightChartsKeyRef = React.useRef<string | null>(null);
+  // PERF: trava "já executei / em execução" para impedir disparos duplicados de gráficos no mesmo contexto
+  const chartsExecutionKeyRef = React.useRef<string | null>(null);
+  // PERF: id incremental para invalidar respostas atrasadas (stale) quando contexto muda
+  const chartsRequestIdRef = React.useRef<number>(0);
+
+  const [tree, setTree] = React.useState<HierarchyNode[]>([]);
+  const [tableTree, setTableTree] = React.useState<any[]>([]);
+  const [lastUpdated, setLastUpdated] = React.useState<Date | null>(null);
+
+  const [entities, setEntities] = React.useState<string[]>([
+    "IABR",
+    "ABIVIDRO",
+    "ABAL",
+    "IBÁ",
+  ]);
+
+  const entitiesUi = React.useMemo(() => ["", ...entities.filter(Boolean)], [entities]);
+  const years = React.useMemo(() => [2022, 2023, 2024, 2025], []);
+
+  const [viewMode, setViewMode] = React.useState<ViewMode>("BOTH");
+
+  // ✅ guarda dicionário completo (para cesta dos gráficos + seed)
+  const [dictRowsAll, setDictRowsAll] = React.useState<DictionaryRow[]>([]);
+
+  // charts
+  const [chartsLoading, setChartsLoading] = React.useState(false);
+  const [chartsError, setChartsError] = React.useState<string | null>(null);
+  const [annualSeries, setAnnualSeries] = React.useState<any[]>([]);
+  // ✅ séries anuais separadas (padrão NCM: import/export separados)
+  const [annualImportSeries, setAnnualImportSeries] = React.useState<any[]>([]);
+  const [annualExportSeries, setAnnualExportSeries] = React.useState<any[]>([]);
+  const [annualBalanceSeries, setAnnualBalanceSeries] = React.useState<any[]>([]);
+  const [annualPriceIeSeries, setAnnualPriceIeSeries] = React.useState<any[]>([]);
+  const [annualPriceSeries, setAnnualPriceSeries] = React.useState<any[]>([]);
+  const [categoryBars, setCategoryBars] = React.useState<any[]>([]);
+  const [subcatBars, setSubcatBars] = React.useState<any[]>([]);
+  const [categoryBarsKg, setCategoryBarsKg] = React.useState<any[]>([]);
+  const [subcatBarsKg, setSubcatBarsKg] = React.useState<any[]>([]);
+
+  // PERF: ao mudar entidade/ano/fluxo/filtros, limpamos estado de gráficos e invalidamos qualquer resposta atrasada
+  const resetChartsState = React.useCallback(() => {
+    chartsRequestIdRef.current += 1; // invalida respostas em voo
+    chartsExecutionKeyRef.current = null; // permite novo carregamento no mesmo contexto (após reset)
+    inFlightChartsKeyRef.current = null;
+    setChartsLoading(false);
+    setChartsError(null);
+    setAnnualSeries([]);
+    setAnnualImportSeries([]);
+    setAnnualExportSeries([]);
+    setAnnualPriceSeries([]);
+    setCategoryBars([]);
+    setSubcatBars([]);
+    setCategoryBarsKg([]);
+    setSubcatBarsKg([]);
+  }, [
+    setChartsLoading,
+    setChartsError,
+    setAnnualSeries,
+    setAnnualImportSeries,
+    setAnnualExportSeries,
+    setAnnualPriceSeries,
+    setCategoryBars,
+    setSubcatBars,
+    setCategoryBarsKg,
+    setSubcatBarsKg,
+  ]);
+  const [diagnostics, setDiagnostics] = React.useState<{
+    dictRows: number;
+    distinctNcms: number;
+    comexRows: number;
+    comexZeroRows: number;
+    apiLikelyDown: boolean;
+    maxDepth: number;
+    duplicateNcms: number;
+    conflictingMappings: number;
+  } | null>(null);
+
+  const loadDictionary = React.useMemo(() => {
+    return pickFn<
+      (entity: string) => Promise<cgimDictionaryService.CgimDictEntry[]>
+    >(cgimDictionaryService, [
+      "loadCgimDictionaryForEntity",
+      "loadDictionaryForEntity",
+      "getCgimDictionaryForEntity",
+      "getDictionaryForEntity",
+    ]);
+  }, []);
+
+  // entities pack
+  // PERF/FIX: este efeito só serve para popular a lista do seletor.
+  // Não deve depender de "requestId" (variável inexistente aqui) nem de estados de gráficos.
+  React.useEffect(() => {
+    let cancelled = false;
+    async function loadEntitiesFromExcel() {
+      try {
+        const pack = await cgimDictionaryService.loadCgimDictionaryFromExcel();
+        if (cancelled) return;
+        const list = (pack.entities ?? []).filter(Boolean);
+        if (list.length) {
+          // Mantém lista para o select, mas NÃO auto-seleciona entidade.
+          setEntities(list);
+          // Se a entidade atual não existir mais (ex.: dicionário mudou), volta para "sem seleção".
+          if (entity && !list.includes(entity)) setEntity("");
+        }
+      } catch {
+        // ignore
+      }
+    }
+    loadEntitiesFromExcel();
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // main load
+  React.useEffect(() => {
+    let cancelled = false;
+
+    async function run() {
+      const effectiveFlow: FlowType = CGIM_TEST_MODE === 1 ? "import" : flow;
+      const tableKey = `${entity}|${year}|${effectiveFlow}`;
+      // ✅ Não faz fetch até usuário ativar e selecionar entidade
+      if (!cgimActive || !entity) return;
+      if (inFlightTableKeyRef.current === tableKey) return;
+      inFlightTableKeyRef.current = tableKey;
+
+      setTree([]);
+      setTableTree([]);
+      setExpandedIds(new Set());
+      setDiagnostics(null);
+	    // PERF/FIX: manter indentação e garantir reset de erro antes do fetch
+	    setError(null);
+      setLastUpdated(null);
+
+        setLoading(true);
+        // Mostra barra imediatamente (independente do callback de progresso)
+        setProgress({ done: 0, total: 1 }); // total real definido após ler dicionário
+
+      try {
+        const dictEntries = await loadDictionary(entity);
+
+        const maxDepthFound =
+          dictEntries.reduce((acc, e) => {
+            const depth = (e.subcategorias ?? []).filter(
+              (x) => !isEmptySubValue(x)
+            ).length;
+            return Math.max(acc, depth);
+          }, 0) || 1;
+
+        setMaxSubcatDepth(maxDepthFound);
+
+        const effectiveDepth = Math.min(subcatDepth, maxDepthFound || 1);
+        if (effectiveDepth !== subcatDepth) setSubcatDepth(effectiveDepth);
+
+        // ✅ linhas completas (SEM dedup) -> seed e cesta dos gráficos
+        const dictRowsRawAll: DictionaryRow[] = (dictEntries ?? [])
+          .map((e) => {
+            const categoria =
+              String(e.categoria ?? "").trim() ||
+              "Sem categoria (mapeamento incompleto)";
+            const subLabel = buildSubcategoryLabel(
+              e.subcategorias ?? [],
+              effectiveDepth
+            );
+            return {
+              ncm: normalizeNcm(e.ncm),
+              categoria,
+              subcategoria: subLabel,
+            } as any;
+          })
+          .filter((r) => !!r.ncm) as DictionaryRow[];
+
+        setDictRowsAll(dictRowsRawAll);
+
+        // ✅ dedup por NCM (mapeamento estável)
+        const seen = new Map<
+          string,
+          { categoria: string; subcategoria: string | null }
+        >();
+        let duplicateNcms = 0;
+        let conflictingMappings = 0;
+
+        const dictRowsDedup: DictionaryRow[] = [];
+        for (const r of dictRowsRawAll) {
+          const ncm = normalizeNcm(r.ncm);
+          if (!ncm) continue;
+
+          const nextMap = {
+            categoria: r.categoria,
+            subcategoria: r.subcategoria ?? null,
+          };
+
+          if (!seen.has(ncm)) {
+            seen.set(ncm, nextMap);
+            dictRowsDedup.push({ ...r, ncm });
+            continue;
+          }
+
+          duplicateNcms++;
+          const prev = seen.get(ncm)!;
+          const isConflict =
+            prev.categoria !== nextMap.categoria ||
+            (prev.subcategoria ?? null) !== (nextMap.subcategoria ?? null);
+
+          if (isConflict) conflictingMappings++;
+          // mantém o primeiro (primeiro wins)
+        }
+
+        const ncmsAllUnique = Array.from(
+          new Set(
+            dictRowsRawAll.map((r) => normalizeNcm(r.ncm)).filter(Boolean)
+          )
+        ) as string[];
+
+        // ✅ Anti-429: use o "modo leve" por padrão (pouca concorrência + backoff).
+        // O serviço já ajusta chunk/concurrency internamente.
+        const useLite = true;
+
+        // força a barra a aparecer imediatamente
+        // loading já está true aqui; mantido apenas por clareza
+    setError(null);
+        setProgress({ done: 0, total: Math.max(1, ncmsAllUnique.length * (CGIM_TEST_MODE === 1 ? 1 : 2)) });
+
+    // Busca Comex (ano cheio) para TODOS os NCMs únicos com chunking (bem menos requests)
+    const importRaw = await fetchComexYearByNcmList({
+      year: String(year),
+      flow: "import",
+      ncms: ncmsAllUnique,
+      lite: useLite,
+      onProgress: ({ done }) =>
+          setProgress({
+            done,
+            total: Math.max(1, ncmsAllUnique.length * (CGIM_TEST_MODE === 1 ? 1 : 2)),
+          }),
+    });
+
+	    // PERF/FIX: evita atualização por efeito antigo (stale) sem depender de requestId de gráficos
+	    if (cancelled || inFlightTableKeyRef.current !== tableKey) return;
+
+    let exportRaw: any[] = [];
+    if (CGIM_TEST_MODE !== 1) {
+      exportRaw = await fetchComexYearByNcmList({
+        year: String(year),
+        flow: "export",
+        ncms: ncmsAllUnique,
+        lite: useLite,
+        onProgress: ({ done, total }) =>
+          setProgress({
+            done: done + ncmsAllUnique.length,
+            total: ncmsAllUnique.length * 2,
+          }),
+      });
+
+      if (cancelled || inFlightTableKeyRef.current !== tableKey) return;
+    }
+
+
+    const basketImportRows = importRaw.map((r: any) => ({
+      ncm: String(r.ncm ?? r.noNcmpt ?? r.coNcm ?? "").replace(/\D/g, ""),
+      fob: Number(r.fob ?? r.metricFOB ?? r.vlFob ?? 0) || 0,
+      kg: Number(r.kg ?? r.metricKG ?? r.kgLiquido ?? 0) || 0,
+    }));
+
+    const basketExportRows = exportRaw.map((r: any) => ({
+      ncm: String(r.ncm ?? r.noNcmpt ?? r.coNcm ?? "").replace(/\D/g, ""),
+      fob: Number(r.fob ?? r.metricFOB ?? r.vlFob ?? 0) || 0,
+      kg: Number(r.kg ?? r.metricKG ?? r.kgLiquido ?? 0) || 0,
+    }));
+
+    const comexRowsImport = basketImportRows.map((r) => ({
+          ncm: r.ncm,
+          metricFOB: r.fob,
+          metricKG: r.kg,
+        }));
+
+        const comexRowsExport = basketExportRows.map((r) => ({
+          ncm: r.ncm,
+          metricFOB: r.fob,
+          metricKG: r.kg,
+        }));
+
+        // Mantém compatibilidade: comexRows "principal" segue o flow selecionado (para não quebrar o resto)
+        const comexRows = (effectiveFlow === "export" ? comexRowsExport : comexRowsImport);
+
+        const comexZeroRows = comexRows.filter(
+          (r) =>
+            (Number(r.fob ?? r.metricFOB ?? 0) || 0) === 0 && (Number(r.kg ?? r.metricKG ?? 0) || 0) === 0
+        ).length;
+
+        const apiLikelyDown =
+          comexRows.length > 0 && comexZeroRows === comexRows.length;
+
+        setDiagnostics({
+          dictRows: dictRowsRawAll.length,
+          distinctNcms: ncmsAllUnique.length,
+          comexRows: comexRows.length,
+          comexZeroRows,
+          apiLikelyDown,
+          maxDepth: maxDepthFound,
+          duplicateNcms,
+          conflictingMappings,
         });
 
-        if (res.status === 429) {
-          // tenta respeitar Retry-After se vier; senão aplica backoff progressivo com jitter
-          const ra = res.headers?.get?.("Retry-After");
-          const raMs = ra ? Number(ra) * 1000 : NaN;
-          const base = Number.isFinite(raMs) && raMs > 0 ? raMs : 12_000;
-          const backoff = base * Math.min(6, Math.max(1, attempt + 1)); // 12s, 24s, 36s... (cap)
-          const jitter = Math.floor(Math.random() * 1500);
-          const waitMs = backoff + jitter;
-          const txt429 = await res.text().catch(() => "");
-          console.warn("[comexApiService] 429 em /general. Aguardando", waitMs, "ms. Detalhe:", txt429);
-          await sleep(waitMs);
-          continue;
-          continue;
+        // ✅ FIX: seedGroupsFromDictionary + seedRows
+        const importTree = buildHierarchyTree({
+          dictRows: dictRowsDedup,
+          seedRows: dictRowsRawAll,
+          comexRows: comexRowsImport,
+          includeUnmapped: true,
+          includeAllZero: apiLikelyDown,
+          seedGroupsFromDictionary: true,
+          includeZeroLeaves: false,
+        });
+
+        let exportTree: any[] = [];
+        if (CGIM_TEST_MODE !== 1) {
+          exportTree = buildHierarchyTree({
+            dictRows: dictRowsDedup,
+            seedRows: dictRowsRawAll,
+            comexRows: comexRowsExport,
+            includeUnmapped: true,
+            includeAllZero: apiLikelyDown,
+            seedGroupsFromDictionary: true,
+            includeZeroLeaves: false,
+          });
         }
 
-        if (!res.ok) {
-          const txt = await res.text().catch(() => "");
-          console.warn("[comexApiService] /general falhou:", res.status, res.statusText, txt);
-          return { ok: false, status: res.status, statusText: res.statusText, rows: [], errorText: txt };
+        // árvore principal
+        setTree(CGIM_TEST_MODE === 1 ? importTree : (effectiveFlow === "export" ? exportTree : importTree));
+
+        // tabela
+        if (CGIM_TEST_MODE === 1) {
+          // Modo 1: apenas IMPORT (sem merge com export)
+          setTableTree(importTree as any);
+        } else {
+          setTableTree(mergeImpExpTrees(importTree, exportTree));
         }
-
-        const json = await res.json();
-        const out = { ok: true, status: res.status, statusText: res.statusText, rows: extractRows(json) };
-        generalCache.set(key, { ts: Date.now(), value: out });
-        return out;
-      }
-
-      // se chegou aqui, estourou retentativas 429
-      return { ok: false, status: 429, statusText: "Too Many Requests", rows: [], errorText: "429 after retries" };
-    });
-
-    generalInFlight.set(key, promise);
-
-    try {
-      return await promise;
-    } finally {
-      generalInFlight.delete(key);
-    }
-  } catch (e: any) {
-    console.warn("[comexApiService] Falha ao consultar /general (POST). Retornando lista vazia.", e);
-    return { ok: false, status: 0, statusText: "NETWORK_ERROR", rows: [], errorText: String(e?.message ?? e) };
-  }
-}
-
-// ====== ✅ NOVO CORE: /general via POST + body (Swagger) ======
-async function comexGeneralRequest(payload: any, timeoutMs = DEFAULT_TIMEOUT_MS): Promise<any[]> {
-  const meta = await comexGeneralRequestWithMeta(payload, timeoutMs);
-  return meta.rows || [];
-}
-
-
-function mapFiltersToComex(filterList: any[], filterArray: any[], detailDatabase: any[], filters: ApiFilter[]) {
-  for (const f of filters || []) {
-    if (f.filter === "ncm") {
-      const items = (f.values || []).map(normalizeNcmLoose).filter(Boolean);
-      filterList.push({ id: "coNcm" });
-      filterArray.push({ item: items, idInput: "coNcm" });
-      // detailDatabase só se você realmente precisa detalhar/agrupador; senão pode ficar vazio
-    }
-  }
-}
-
-// ===== EXPORTS DO APP =====
-
-export async function fetchLastUpdateData(): Promise<LastUpdateData> {
-  for (const url of LAST_UPDATE_ENDPOINTS) {
-    try {
-      const res = await fetchWithTimeout(url, 15_000);
-      if (!res.ok) continue;
-      const json = await res.json();
-      if (json && Number.isFinite(json.year) && Number.isFinite(json.month)) {
-        return { year: Number(json.year), month: Number(json.month) };
-      }
-      const data = json?.data ?? json;
-
-      if (data && Number.isFinite(data.ano) && Number.isFinite(data.mes)) {
-        return { year: Number(data.ano), month: Number(data.mes) };
-      }
-
-      const updatedAt = data?.updatedAt ?? data?.updated_at ?? data?.dataAtualizacao ?? data?.lastUpdate;
-      if (typeof updatedAt === "string" && updatedAt) {
-        const d = new Date(updatedAt);
-        if (!Number.isNaN(d.getTime())) {
-          return { year: d.getFullYear(), month: d.getMonth() + 1 };
+        setLastUpdated(new Date());
+        setExpandedIds(new Set());
+	      } catch (e: any) {
+	        if (cancelled || inFlightTableKeyRef.current !== tableKey) return;
+        setError(e?.message ? String(e.message) : "Erro ao carregar dados.");
+      } finally {
+        // libera lock de fetch
+        if (!cancelled) inFlightTableKeyRef.current = null;
+        if (!cancelled) {
+          setLoading(false);
+          setProgress(null);
         }
       }
-    } catch {
-      // segue
     }
-  }
-  const now = new Date();
-  return { year: now.getFullYear(), month: now.getMonth() + 1 };
-}
 
-export async function fetchNcmDescription(ncm: string): Promise<string> {
-  const n = normalizeNcmLoose(ncm);
-  if (!n) return "";
+    run();
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [cgimActive, entity, year, flow, subcatDepth]);
 
-  // ✅ Prioriza host novo com hífen (HTTPS).
-  // Mantém fallback legado (HTTPS) se necessário.
-  const candidates = [
-    `https://api-comexstat.mdic.gov.br/tables/ncm/${n}`,
-    `https://api-comexstat.mdic.gov.br/tables/ncm?code=${n}`,
-    `https://api-comexstat.mdic.gov.br/tables/ncm?noNcm=${n}`,
+  const availableCategories = React.useMemo(() => listCategories(tree), [tree]);
+  const availableSubcategories = React.useMemo(
+    () => listSubcategories(tree, selectedCategories),
+    [tree, selectedCategories]
+  );
 
-    `https://api.comexstat.mdic.gov.br/tables/ncm/${n}`,
-    `https://api.comexstat.mdic.gov.br/tables/ncm?code=${n}`,
-    `https://api.comexstat.mdic.gov.br/tables/ncm?noNcm=${n}`,
-  ];
+  const total = React.useMemo(() => computeTotal(tree), [tree]);
 
-  for (const url of candidates) {
-    try {
-      const res = await fetchWithTimeout(url, 15_000);
-      if (!res.ok) continue;
-      const json = await res.json();
-      const desc =
-        json?.description ??
-        json?.descricao ??
-        json?.noNcmpt ??
-        json?.noNcm ??
-        json?.data?.description ??
-        json?.data?.descricao;
-      if (typeof desc === "string") return desc;
-    } catch {
-      // segue
+  // ✅ charts: cesta via dicionário
+  React.useEffect(() => {
+    let cancelled = false;
+    let t: any = null;
+
+    async function runCharts() {
+      // MODO 1: gráficos totalmente desabilitados
+      if (CGIM_TEST_MODE === 1) return;
+            // PERF: chave determinística (ordena arrays) para impedir disparos duplicados com o mesmo payload
+      const catsKey = [...selectedCategories].sort().join(",");
+      const subsKey = [...selectedSubcategories].sort().join(",");
+      const chartsKey = `${entity}|${year}|${flow}|${catsKey}|${subsKey}`;
+      const requestId = chartsRequestIdRef.current;
+      // ✅ Não faz fetch até usuário ativar e selecionar entidade
+      if (!cgimActive || !entity || !chartsActive) return;
+      // PERF: não dispara novamente para o mesmo contexto enquanto não houver reset explícito
+      if (chartsExecutionKeyRef.current === chartsKey) return;
+      chartsExecutionKeyRef.current = chartsKey;
+      // PERF: dedupe "em voo" (paralelo) para o mesmo contexto
+      if (inFlightChartsKeyRef.current === chartsKey) return;
+      inFlightChartsKeyRef.current = chartsKey;
+
+      if (!dictRowsAll.length) {
+        setAnnualSeries([]);
+        setAnnualPriceSeries([]);
+        setCategoryBars([]);
+          setSubcatBars([]);
+          setCategoryBarsKg([]);
+          setSubcatBarsKg([]);
+        return;
+      }
+
+      setChartsLoading(true);
+      setChartsError(null);
+
+      try {
+        const ncms = collectNcmsFromDictionary({
+          dictRowsAll,
+          selectedCategories,
+          selectedSubcategories,
+        });
+
+        if (!ncms.length) {
+          setAnnualSeries([]);
+          setAnnualPriceSeries([]);
+          setCategoryBars([]);
+          setSubcatBars([]);
+          return;
+        }
+
+        // 🔒 Janela histórica menor para reduzir 429 (pode ajustar: 5, 8, 10...)
+        const YEARS_WINDOW = 5;
+        const yearStart = Math.max(2010, year - YEARS_WINDOW);
+        const yearEnd = year;
+
+        // ✅ Padrão NCM: séries anuais separadas para Importação e Exportação
+        // ✅ Fetch sequencial (evita rajada: reduz 429).
+        const impSeriesRaw = await fetchBasketAnnualSeries({
+            flow: "import",
+            yearStart,
+            yearEnd,
+            ncms,
+            lite: true,
+            useCache: true,
+            cacheTtlHours: 24,
+        });
+        if (cancelled || chartsRequestIdRef.current !== requestId) return;
+        // 🕒 Espaçamento entre séries (reduz 429 em Cloudflare/ComexStat)
+        await new Promise((r) => setTimeout(r, 1500));
+        const expSeriesRaw = await fetchBasketAnnualSeries({
+            flow: "export",
+            yearStart,
+            yearEnd,
+            ncms,
+            lite: true,
+            useCache: true,
+            cacheTtlHours: 24,
+        });
+
+        if (cancelled || chartsRequestIdRef.current !== requestId) return;
+
+        const impSeries = impSeriesRaw.map((p) => ({
+          name: String(p.year),
+          fob: p.fob,
+          kg: p.kg,
+          usdPerTon: p.usdPerTon,
+        }));
+        const expSeries = expSeriesRaw.map((p) => ({
+          name: String(p.year),
+          fob: p.fob,
+          kg: p.kg,
+          usdPerTon: p.usdPerTon,
+        }));
+
+        // Mantém annualSeries (legado) como importação para não quebrar usos existentes
+        setAnnualSeries(impSeries.map((p) => ({ name: p.name, fob: p.fob, kg: p.kg })));
+        setAnnualImportSeries(impSeries.map((p) => ({ name: p.name, fob: p.fob, kg: p.kg })));
+        setAnnualExportSeries(expSeries.map((p) => ({ name: p.name, fob: p.fob, kg: p.kg })));
+
+        // Preço médio: Importação vs Exportação no mesmo dataset por ano
+        const byYear = new Map<string, { importPrice?: number; exportPrice?: number; importFob?: number; exportFob?: number }>();
+        for (const p of impSeries) {
+          byYear.set(p.name, { ...(byYear.get(p.name) || {}), importPrice: p.usdPerTon, importFob: p.fob });
+        }
+        for (const p of expSeries) {
+          byYear.set(p.name, { ...(byYear.get(p.name) || {}), exportPrice: p.usdPerTon, exportFob: p.fob });
+        }
+        const yearsSorted = Array.from(byYear.keys()).sort((a, b) => Number(a) - Number(b));
+
+        const priceIE = yearsSorted.map((y) => ({
+          name: y,
+          importPrice: byYear.get(y)?.importPrice ?? 0,
+          exportPrice: byYear.get(y)?.exportPrice ?? 0,
+        }));
+        setAnnualPriceIeSeries(priceIE);
+        // Mantém annualPriceSeries (legado) apontando para a mesma série (não quebra)
+        setAnnualPriceSeries(priceIE.map((p) => ({ name: p.name, usdPerTon: p.importPrice })));
+
+        const balance = yearsSorted.map((y) => {
+          const ex = byYear.get(y)?.exportFob ?? 0;
+          const im = byYear.get(y)?.importFob ?? 0;
+          return { name: y, exportFob: ex, importFob: im, balanceFob: ex - im };
+        });
+        setAnnualBalanceSeries(balance);
+
+        // barras usando a árvore (com seed), ok
+        const catSet = new Set((selectedCategories || []).filter(Boolean));
+        const subSet = new Set((selectedSubcategories || []).filter(Boolean));
+
+        const cats: any[] = [];
+        for (const cat of tree) {
+          if (catSet.size && !catSet.has(cat.name)) continue;
+          cats.push({ name: cat.name, fob: cat.metrics.fob });
+        }
+        cats.sort((a, b) => (b.fob || 0) - (a.fob || 0));
+        setCategoryBars(cats.slice(0, 20));
+
+        const catsKg: any[] = [];
+        for (const cat of tree) {
+          if (catSet.size && !catSet.has(cat.name)) continue;
+          catsKg.push({ name: cat.name, kg: cat.metrics.kg });
+        }
+        catsKg.sort((a, b) => (b.kg || 0) - (a.kg || 0));
+        setCategoryBarsKg(catsKg.slice(0, 20));
+
+        const subs: any[] = [];
+        for (const cat of tree) {
+          if (catSet.size && !catSet.has(cat.name)) continue;
+          for (const sub of cat.children || []) {
+            if (sub.level !== "subcategory") continue;
+            if (subSet.size && !subSet.has(sub.name)) continue;
+            subs.push({
+              name: `${cat.name} • ${sub.name}`,
+              fob: sub.metrics.fob,
+            });
+          }
+        }
+        subs.sort((a, b) => (b.fob || 0) - (a.fob || 0));
+        setSubcatBars(subs.slice(0, 25));
+
+        const subsKg: any[] = [];
+        for (const cat of tree) {
+          if (catSet.size && !catSet.has(cat.name)) continue;
+          for (const sub of cat.children || []) {
+            if (sub.level !== "subcategory") continue;
+            if (subSet.size && !subSet.has(sub.name)) continue;
+            subsKg.push({
+              name: `${cat.name} • ${sub.name}`,
+              kg: sub.metrics.kg,
+            });
+          }
+        }
+        subsKg.sort((a, b) => (b.kg || 0) - (a.kg || 0));
+        setSubcatBarsKg(subsKg.slice(0, 25));
+      } catch (e: any) {
+        if (cancelled || chartsRequestIdRef.current !== requestId) return;
+        setChartsError(
+          e?.message ? String(e.message) : "Erro ao carregar gráficos."
+        );
+        // PERF: em caso de erro, libera re-tentativa no mesmo contexto
+        chartsExecutionKeyRef.current = null;
+        setChartsActive(false);
+      } finally {
+        // libera lock de fetch dos gráficos
+        if (!cancelled) inFlightChartsKeyRef.current = null;
+        if (!cancelled) setChartsLoading(false);
+      }
     }
-  }
-  return "";
-}
 
-export async function fetchNcmUnit(ncm: string): Promise<string> {
-  const n = normalizeNcmLoose(ncm);
-  if (!n) return "";
+    t = setTimeout(runCharts, 250);
+    return () => {
+      cancelled = true;
+      if (t) clearTimeout(t);
+    };
+  }, [cgimActive, chartsActive, entity, year, dictRowsAll, selectedCategories, selectedSubcategories, flow, tree]);
 
-  const candidates = [
-    `https://api-comexstat.mdic.gov.br/tables/ncm/${n}`,
-    `https://api-comexstat.mdic.gov.br/tables/ncm?code=${n}`,
-    `https://api-comexstat.mdic.gov.br/tables/ncm?noNcm=${n}`,
-
-    `https://api.comexstat.mdic.gov.br/tables/ncm/${n}`,
-    `https://api.comexstat.mdic.gov.br/tables/ncm?code=${n}`,
-    `https://api.comexstat.mdic.gov.br/tables/ncm?noNcm=${n}`,
-  ];
-
-  for (const url of candidates) {
-    try {
-      const res = await fetchWithTimeout(url, 15_000);
-      if (!res.ok) continue;
-      const json = await res.json();
-      const unit =
-        json?.unit ??
-        json?.unidade ??
-        json?.noUnid ??
-        json?.data?.unit ??
-        json?.data?.unidade ??
-        json?.data?.noUnid;
-      if (typeof unit === "string") return unit;
-    } catch {
-      // segue
+  const expandAll = React.useCallback(() => {
+    const ids = new Set<string>();
+    for (const cat of tree) {
+      ids.add(cat.id);
+      for (const ch of cat.children ?? []) {
+        if (ch.level === "subcategory") ids.add(ch.id);
+      }
     }
-  }
-  return "";
-}
+    setExpandedIds(ids);
+  }, [tree]);
 
-export async function fetchComexData(
-  flow: TradeFlowUi,
-  period: Period,
-  filters: ApiFilter[],
-  metrics: string[],
-  groupBy: string[] = []
-): Promise<ComexStatRecord[]> {
-  const { yearStart, yearEnd, monthStart, monthEnd } = periodToYears(period);
-  const metricFlags = buildMetricsFlags(metrics);
+  const collapseAll = React.useCallback(() => setExpandedIds(new Set()), []);
+  const resetFilters = React.useCallback(() => {
+    setSelectedCategories([]);
+    setSelectedSubcategories([]);
+  }, []);
 
-  const detailDatabase: any[] = [];
-  const filterList: any[] = [];
-  const filterArray: any[] = [];
-
-  mapFiltersToComex(filterList, filterArray, detailDatabase, filters);
-
-  const wantsNcmDetail = (groupBy || []).includes("ncm");
-  if (wantsNcmDetail) {
-    if (!detailDatabase.some((d) => d.id === "noNcmpt")) {
-      detailDatabase.push({ id: "noNcmpt", text: "" });
-    }
-  }
-
-  const payload = {
-    yearStart: String(yearStart),
-    yearEnd: String(yearEnd),
-    typeForm: toApiTypeFormFromUi(flow),
-    typeOrder: 1,
-    filterList,
-    filterArray,
-    detailDatabase,
-    monthDetail: false,
-    ...metricFlags,
-    monthStart,
-    monthEnd,
-    formQueue: "general",
-    langDefault: "pt",
+  const cardStyle: React.CSSProperties = {
+    border: "1px solid #e6e6e6",
+    borderRadius: 12,
+    padding: 14,
+    background: "#fff",
   };
 
-  return await comexGeneralRequest(payload);
-}
-
-export async function fetchMonthlyComexData(
-  flow: TradeFlowUi,
-  period: Period,
-  filters: ApiFilter[],
-  metrics: string[]
-): Promise<MonthlyComexStatRecord[]> {
-  const { yearStart, yearEnd, monthStart, monthEnd } = periodToYears(period);
-  const metricFlags = buildMetricsFlags(metrics);
-
-  const detailDatabase: any[] = [];
-  const filterList: any[] = [];
-  const filterArray: any[] = [];
-
-  mapFiltersToComex(filterList, filterArray, detailDatabase, filters);
-
-  const payload = {
-    yearStart: String(yearStart),
-    yearEnd: String(yearEnd),
-    typeForm: toApiTypeFormFromUi(flow),
-    typeOrder: 1,
-    filterList,
-    filterArray,
-    detailDatabase,
-    monthDetail: true,
-    ...metricFlags,
-    monthStart,
-    monthEnd,
-    formQueue: "general",
-    langDefault: "pt",
+  // Rodapé padrão (igual ao módulo NCM)
+  const sourceFooterStyle: React.CSSProperties = {
+    marginTop: 10,
+    fontSize: 12,
+    opacity: 0.7,
+    textAlign: "center",
+  };
+  const labelStyle: React.CSSProperties = {
+    fontSize: 12,
+    opacity: 0.7,
+    marginBottom: 6,
   };
 
-  return await comexGeneralRequest(payload);
-}
+  const controlRow: React.CSSProperties = {
+    display: "grid",
+    gridTemplateColumns: "1fr 1fr 1fr 1fr",
+    gap: 12,
+  };
 
-export async function fetchCountryData(
-  ncm: string,
-  flow: TradeFlowUi,
-  year: number
-): Promise<CountryDataRecord[]> {
-  const n = normalizeNcmLoose(ncm);
-  if (!n || !Number.isFinite(year)) return [];
+  const filtersStack: React.CSSProperties = {
+    display: "flex",
+    flexDirection: "column",
+    gap: 12,
+  };
 
-  const countryDetailIds = ["noPais", "noPaisOrigem", "noPaisDestino", "coPais", "coPaisOrigem", "coPaisDestino"];
+  const selectBoxStyle: React.CSSProperties = {
+    width: "100%",
+    padding: 10,
+    borderRadius: 10,
+    border: "1px solid #ddd",
+  };
 
-  for (const countryId of countryDetailIds) {
-    const payload = {
-      yearStart: String(year),
-      yearEnd: String(year),
-      typeForm: toApiTypeFormFromUi(flow),
-      typeOrder: 1,
-      filterList: [{ id: "coNcm" }],
-      filterArray: [{ item: [n], idInput: "coNcm" }],
-      detailDatabase: [{ id: countryId, text: "" }],
-      monthDetail: false,
-      metricFOB: true,
-      metricKG: true,
-      metricStatistic: false,
-      monthStart: "01",
-      monthEnd: "12",
-      formQueue: "general",
-      langDefault: "pt",
+  const multiSelectStyleBase: React.CSSProperties = {
+    ...selectBoxStyle,
+    minHeight: 140,
+  };
+  const multiSelectSubcatStyle: React.CSSProperties = {
+    ...selectBoxStyle,
+    minHeight: 260,
+  };
+
+  // ✅ AQUI: barra sticky volta a cobrir TABELA e GRÁFICOS
+  // ✅ também mostrar loader durante carregamento da tabela (não só gráficos)
+  const showTopLoading = loading || chartsLoading;
+  const topLoadingTitle = loading ? "Carregando tabela…" : "Carregando gráficos…";
+  const hasProgress = !!(progress && progress.total);
+  const pct = hasProgress
+    ? Math.max(0, Math.min(100, Math.round((progress!.done / progress!.total) * 100)))
+    : 0;
+
+
+  // ✅ Identificador curto da cesta atual (para títulos dos gráficos)
+  const basketLabel = React.useMemo(() => {
+    const cats = (selectedCategories || []).filter(Boolean);
+    const subs = (selectedSubcategories || []).filter(Boolean);
+
+    const fmtList = (arr: string[], max = 3) => {
+      if (!arr.length) return "Todas";
+      const head = arr.slice(0, max).join(", ");
+      const tail = arr.length > max ? ` +${arr.length - max}` : "";
+      return head + tail;
     };
 
-    const rows = await comexGeneralRequest(payload);
-    if (rows.length === 0) continue;
+    const catLabel = fmtList(cats, 3);
+    const subLabel = fmtList(subs, 2);
+    return subs.length ? `${entity} • ${catLabel} • ${subLabel}` : `${entity} • ${catLabel}`;
+  }, [cgimActive, entity, selectedCategories, selectedSubcategories]);
 
-    const totalFOB =
-      rows.reduce((acc: number, r: any) => acc + Number(r?.metricFOB ?? r?.vlFob ?? r?.vl_fob ?? r?.fob ?? 0), 0) || 0;
-    const totalKG =
-      rows.reduce((acc: number, r: any) => acc + Number(r?.metricKG ?? r?.kgLiquido ?? r?.kg_liquido ?? r?.kg ?? 0), 0) || 0;
+  // ✅ Série derivada para a balança: importações negativas (para ficar abaixo do eixo zero)
+  // (Não altera a lógica de dados — apenas a representação visual no gráfico.)
+  const annualBalanceSeriesSigned = React.useMemo(() => {
+    return (annualBalanceSeries || []).map((d) => ({
+      ...d,
+      exportFobPos: Math.abs(Number((d as any).exportFob ?? 0)),
+      importFobNeg: -Math.abs(Number((d as any).importFob ?? 0)),
+    }));
+  }, [annualBalanceSeries]);
 
-    const out: CountryDataRecord[] = rows
-      .map((r: any) => {
-        const fob = Number(r?.metricFOB ?? r?.vlFob ?? r?.vl_fob ?? r?.fob ?? 0) || 0;
-        const kg = Number(r?.metricKG ?? r?.kgLiquido ?? r?.kg_liquido ?? r?.kg ?? 0) || 0;
-
-        const countryName =
-          String(r?.noPais ?? r?.no_pais ?? r?.pais ?? r?.country ?? r?.noPaispt ?? r?.noPaisEn ?? "").trim() ||
-          String(r?.coPais ?? r?.co_pais ?? "").trim() ||
-          "—";
-
-        return {
-          country: countryName,
-          metricFOB: fob,
-          metricKG: kg,
-          representatividadeFOB: totalFOB > 0 ? (fob / totalFOB) * 100 : 0,
-          representatividadeKG: totalKG > 0 ? (kg / totalKG) * 100 : 0,
-        };
-      })
-      .sort((a, b) => (b.metricFOB || 0) - (a.metricFOB || 0));
-
-    return out;
-  }
-
-  return [];
-}
-
-// ===== EXPORT EXTRA PARA O CGIM =====
-
-/**
- * ✅ Export que o CGIM precisa (cgimBasketComexService.ts):
- * Busca FOB/KG de uma NCM (8 dígitos) em um ano.
- */
-export async function fetchComexYearByNcm(args: {
-  flow: TradeFlow; // "imp" | "exp"
-  ncm: string;     // 8 dígitos
-  year: number;
-}): Promise<NcmYearValue> {
-  const ncm8 = normalizeNcmTo8(args.ncm);
-  if (!ncm8 || !Number.isFinite(args.year)) return { fob: 0, kg: 0 };
-
-  const payload = {
-    yearStart: String(args.year),
-    yearEnd: String(args.year),
-    typeForm: toApiTypeForm(args.flow),
-    typeOrder: 1,
-    filterList: [{ id: "coNcm" }],
-    filterArray: [{ item: [ncm8], idInput: "coNcm" }],
-    detailDatabase: [{ id: "noNcmpt", text: "" }],
-    monthDetail: false,
-    metricFOB: true,
-    metricKG: true,
-    metricStatistic: false,
-    monthStart: "01",
-    monthEnd: "12",
-    formQueue: "general",
-    langDefault: "pt",
-  };
-
-  try {
-    const resRows = await comexGeneralRequest(payload);
-    if (!resRows.length) return { fob: 0, kg: 0 };
-    const r = resRows[0];
-    return {
-      fob: Number(r?.metricFOB ?? r?.vlFob ?? r?.vl_fob ?? r?.fob ?? 0) || 0,
-      kg: Number(r?.metricKG ?? r?.kgLiquido ?? r?.kg_liquido ?? r?.kg ?? 0) || 0,
-    };
-  } catch (e) {
-    console.warn("[fetchComexYearByNcm] Falha ao consultar ComexStat. Retornando 0.", e);
-    return { fob: 0, kg: 0 };
-  }
-}
-
-/**
- * ✅ NOVO (CGIM em lote): busca FOB/KG para UMA LISTA de NCMs
- * Agora com chunk + limite de concorrência para reduzir bloqueios.
- */
-export async function fetchComexYearByNcmList(args: {
-  year: string;
-  flow: "import" | "export";
-  ncms: string[];
-  lite?: boolean;
-  /**
-   * Callback opcional para atualizar barra de progresso na UI.
-   * done/total contam NCMs processados (não requests).
-   */
-  onProgress?: (info: { done: number; total: number; chunk: number; chunks: number }) => void;
-}): Promise<NcmYearRow[]> {
-  /*
-  const year = args.year;
-  const flow = args.flow;
-  const lite = !!args.lite;
-  const onProgress = args.onProgress;
-
-  // normaliza NCMs (8 dígitos, numérico)
-  const ncms = (args.ncms || [])
-    .map((x) => String(x || "").replace(/\D/g, ""))
-    .filter((x) => x.length === 8);
-
-  if (ncms.length === 0) return [];
-
-  // Para evitar 429 em produção, prioriza poucos requests grandes (por lista)
-  //  - lite: chunk menor (resposta mais rápida)
-  //  - normal: chunk maior (menos chamadas)
-  const chunkSize = lite ? 50 : 120;
-  const chunks = Math.max(1, Math.ceil(ncms.length / chunkSize));
-
-  const out: NcmYearRow[] = [];
-  let done = 0;
-
-  for (let c = 0; c < chunks; c++) {
-    const slice = ncms.slice(c * chunkSize, (c + 1) * chunkSize);
-
-    // Monta filtro por LISTA (tentando primeiro "coNcm", fallback "noNcmpt")
-    const buildReq = (id: "coNcm" | "noNcmpt") => {
-      const filterList = [{ id }];
-      const filterArray = [{ item: slice, idInput: id }];
-      // detailDatabase só se precisar detalhar/agrupador
-      return buildComexRequest({
-        flow,
-        year,
-        filterList,
-        filterArray,
-        monthDetail: false,
-        details: ["noNcmpt"],
-        metrics: ["metricFOB", "metricKG"],
-      });
-    };
-
-    // 1) tenta coNcm
-    let rows = await comexGeneralRequestWithMeta<NcmYearRow[]>(buildReq("coNcm")).then((r) => r.data || []);
-
-    // 2) fallback (só se veio vazio)
-    if (rows.length === 0) {
-      rows = await comexGeneralRequestWithMeta<NcmYearRow[]>(buildReq("noNcmpt")).then((r) => r.data || []);
+  // ✅ Domínio simétrico em torno de zero, para o gráfico de balança (barras + linha)
+  const balanceMaxAbs = React.useMemo(() => {
+    let max = 0;
+    for (const d of annualBalanceSeriesSigned) {
+      const a = Math.abs(Number((d as any).exportFobPos ?? 0));
+      const b = Math.abs(Number((d as any).importFobNeg ?? 0));
+      const c = Math.abs(Number((d as any).balanceFob ?? 0));
+      max = Math.max(max, a, b, c);
     }
+    if (!Number.isFinite(max) || max <= 0) return 1;
+    return max * 1.15;
+  }, [annualBalanceSeriesSigned]);
 
-    out.push(...rows);
 
-    done += slice.length;
-    if (onProgress) onProgress({ done, total: ncms.length, chunk: c + 1, chunks });
-  }
+  const tickFob = React.useCallback((v: any) => formatMoneyUS(Number(v) || 0), []);
+  const tickKg = React.useCallback((v: any) => formatKg(Number(v) || 0), []);
+  const tickPrice = React.useCallback((v: any) => formatUsdPerTonTable(Number(v) || 0), []);
 
-  // Garantia: se a API não devolver algo para algum NCM, devolvemos zero para manter consistência
-  const byNcm = new Map<string, NcmYearRow>();
-  for (const r of out) {
-    const n = String((r as any).noNcmpt ?? (r as any).ncm ?? "").replace(/\D/g, "");
-    if (!n) continue;
-    byNcm.set(n, {
-      ...(r as any),
-      noNcmpt: n,
-    });
-  }
+  // Aliases/formatters (mantém compatibilidade com o painel extraído)
+  const tickUsd = tickFob;
+  const tickUsdPerTon = tickPrice;
+  const tickUsdSigned = React.useCallback((v: any) => {
+    const n = Number(v) || 0;
+    const sign = n < 0 ? "-" : "";
+    return sign + formatMoneyUS(Math.abs(n));
+  }, []);
 
-  return ncms.map((ncm) => {
-    const r = byNcm.get(ncm);
-    if (r) return r;
-    return {
-      noNcmpt: ncm,
-      metricFOB: 0,
-      metricKG: 0,
-    } as any;
-  */
-  const year = Number(args.year);
 
-  const ncms8 = (args.ncms ?? [])
-    .map((n) => normalizeNcmTo8(n))
-    .filter((x): x is string => Boolean(x));
+// Textos explicativos (condensados) — lembrando que este módulo é sempre por ENTIDADE.
+// As "categorias" e "subcategorias" aqui são agrupamentos internos da cesta daquela entidade (e podem variar por entidade).
+const compositionCategoryTextFob =
+  "Mostra como o valor FOB total da cesta da entidade se distribui entre as categorias internas mapeadas no dicionário (por exemplo, famílias/linhas de produtos dentro daquela entidade). Ajuda a identificar rapidamente onde está a concentração do valor, se existe dependência de poucos grupos e quais categorias são residuais — útil para diagnósticos setoriais e priorização de análises.";
 
-  if (!Number.isFinite(year) || !ncms8.length) return [];
+const compositionSubcategoryTextFob =
+  "Mostra como o valor FOB total da cesta da entidade se distribui entre as subcategorias internas (níveis abaixo das categorias, quando existirem). Ajuda a enxergar quais segmentos específicos sustentam o valor, se há concentração em um único subconjunto e quais subcategorias relevantes ficam escondidas quando olhamos só a categoria — útil para direcionar investigações e recortes mais finos por NCM.";
 
-  const flow: TradeFlow =
-    args.flow === "export" ? "exp" : args.flow === "import" ? "imp" : (args.flow as TradeFlow);
+const compositionCategoryTextKg =
+  "Mostra como o volume (KG) total da cesta da entidade se distribui entre as categorias internas mapeadas no dicionário. Ajuda a identificar quais grupos concentram o volume, se existe dependência de poucos itens e quais categorias são residuais — útil para análises de escala, capacidade e exposição por volume.";
 
-  // ---- chunk helper ----
-  const chunk = <T,>(arr: T[], size: number): T[][] => {
-    const out: T[][] = [];
-    for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
-    return out;
-  };
+const compositionSubcategoryTextKg =
+  "Mostra como o volume (KG) total da cesta da entidade se distribui entre as subcategorias internas (níveis abaixo das categorias, quando existirem). Ajuda a enxergar quais segmentos concentram o volume, se há concentração em um único subconjunto e quais subcategorias relevantes ficam escondidas quando olhamos só a categoria — útil para direcionar investigações e recortes mais finos por NCM.";
 
-  // ---- execução com limite de concorrência ----
-  const lite = Boolean(args.lite);
+  return (
+    <>
+      <style>{`
+        .cgimAnnualGrid2 {
+          display: grid;
+          grid-template-columns: repeat(2, minmax(0, 1fr));
+          gap: 12px;
+          align-items: stretch;
+        }
+        @media (max-width: 1100px) {
+          .cgimAnnualGrid2 {
+            grid-template-columns: 1fr;
+          }
+        }
+      `}</style>
+    <div
+      style={{ padding: 18, display: "flex", flexDirection: "column", gap: 14 }}
+    >
+      {/* Loader sticky (extraído) */}
+      <CgimStickyLoader
+        show={showTopLoading}
+        title={topLoadingTitle}
+        progress={progress}
+        cardStyle={cardStyle}
+      />
 
-  const chunkSize = lite ? 80 : CGIM_MAX_NCMS_PER_REQUEST;
-  const maxConcurrency = lite ? 1 : CGIM_MAX_CONCURRENCY;
-  // Em produção (Netlify), preferimos MENOS requests (chunks maiores) + pacing explícito
-  const delayBetweenChunksMs = lite ? 900 : 0;
-  // Backoff mais conservador em 429
-  const retry429WaitMs = lite ? 15_000 : 0;
+      <div
+        style={{
+          display: "flex",
+          justifyContent: "space-between",
+          alignItems: "flex-end",
+          gap: 12,
+        }}
+      >
+        <div>
+          <h2 style={{ margin: 0 }}>Comexsetor • Módulo CGIM</h2>
+          <div style={{ fontSize: 13, opacity: 0.75 }}>
+            Visualização hierárquica + gráficos por cesta.
+          </div>
+        </div>
+        <div style={{ fontSize: 12, opacity: 0.7, textAlign: "right" }}>
+          {lastUpdated ? (
+            <span>Atualizado em {lastUpdated.toLocaleString("pt-BR")}</span>
+          ) : (
+            <span>—</span>
+          )}
+        </div>
+      </div>
 
-  const chunks = chunk(ncms8, chunkSize);
 
-  const results: NcmYearRow[] = [];
-  let idx = 0;
+      {/* ✅ Gating: não dispara chamadas automaticamente ao abrir o módulo CGIM */}
+      <div style={{ ...cardStyle, padding: 12 }}>
+        {!entity ? (
+          <div style={{ fontSize: 13, opacity: 0.85 }}>
+            <div style={{ fontWeight: 700, marginBottom: 4 }}>
+              Selecione a Entidade
+            </div>
+            <div>
+              Escolha uma entidade no seletor para iniciar. Nenhuma consulta à
+              API será feita até você clicar em <b>“Iniciar análise”</b>.
+            </div>
+          </div>
+        ) : !cgimActive ? (
+          <div
+            style={{
+              display: "flex",
+              justifyContent: "space-between",
+              alignItems: "center",
+              gap: 12,
+              flexWrap: "wrap",
+            }}
+          >
+            <div style={{ fontSize: 13, opacity: 0.85 }}>
+              <div style={{ fontWeight: 700, marginBottom: 4 }}>
+                Pronto para iniciar
+              </div>
+              <div>
+                Entidade selecionada: <b>{entity}</b>. Clique para carregar os
+                dados.
+              </div>
+            </div>
+            <button
+              type="button"
+              onClick={() => {
+                setChartsActive(false);
+                resetChartsState();
+                setCgimActive(true);
+              }}
+              style={{
+                padding: "10px 12px",
+                borderRadius: 10,
+                border: "1px solid rgba(0,0,0,0.12)",
+                background: "white",
+                cursor: "pointer",
+                fontWeight: 700,
+              }}
+            >
+              Iniciar análise
+            </button>
+          </div>
+        ) : (
+          <div
+            style={{
+              display: "flex",
+              justifyContent: "space-between",
+              alignItems: "center",
+              gap: 12,
+              flexWrap: "wrap",
+            }}
+          >
+            <div style={{ fontSize: 13, opacity: 0.85 }}>
+              Análise ativa para <b>{entity}</b>. Alterar a entidade irá pausar
+              a análise.
+            </div>
+            <button
+              type="button"
+              onClick={() => {
+                setChartsActive(false);
+                setCgimActive(false);
+              }}
+              style={{
+                padding: "10px 12px",
+                borderRadius: 10,
+                border: "1px solid rgba(0,0,0,0.12)",
+                background: "white",
+                cursor: "pointer",
+                fontWeight: 700,
+              }}
+            >
+              Pausar
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                // PERF: permite disparar uma nova carga de gráficos (mesmo contexto) ao clicar novamente após reset/erro
+                resetChartsState();
+                setChartsActive(true);
+              }}
+              disabled={CGIM_TEST_MODE === 1 || chartsActive}
+              title={CGIM_TEST_MODE === 1 ? "Modo 1: gráficos desabilitados" : (chartsActive ? "Gráficos já carregados" : "Carregar gráficos (pode fazer várias consultas)")}
+              style={{
+                padding: "10px 12px",
+                borderRadius: 10,
+                border: "1px solid rgba(0,0,0,0.12)",
+                background: chartsActive ? "rgba(0,0,0,0.06)" : "white",
+                cursor: chartsActive ? "not-allowed" : "pointer",
+                fontWeight: 600,
+              }}
+            >
+              {CGIM_TEST_MODE === 1 ? "Gráficos desabilitados (Modo 1)" : (chartsActive ? "Gráficos carregados" : "Carregar gráficos")}
+            </button>
 
-  // PERF: progresso por NCM (para barra dinâmica na UI)
-  const total = ncms8.length;
-  let done = 0;
+          </div>
+        )}
+      </div>
 
-  const worker = async () => {
-    while (idx < chunks.length) {
-      const myIdx = idx++;
-      const thisChunk = chunks[myIdx];
+      {/* Painel de controles (extraído) */}
+      {/* Painel de controles (extraído) */}
+<CgimControlsPanel
+  cardStyle={cardStyle}
+  labelStyle={labelStyle}
+  selectBoxStyle={selectBoxStyle}
+  multiSelectStyleBase={multiSelectStyleBase}
+  multiSelectSubcatStyle={multiSelectSubcatStyle}
 
-      const payload = {
-        yearStart: String(year),
-        yearEnd: String(year),
-        typeForm: toApiTypeForm(flow),
-        typeOrder: 1,
-        filterList: [{ id: "coNcm" }],
-        filterArray: [{ item: thisChunk, idInput: "coNcm" }],
-        detailDatabase: [{ id: "noNcmpt", text: "" }], // força retorno por NCM
-        monthDetail: false,
-        metricFOB: true,
-        metricKG: true,
-        metricStatistic: false,
-        monthStart: "01",
-        monthEnd: "12",
-        formQueue: "general",
-        langDefault: "pt",
-      };
+  entity={entity}
+  entities={entitiesUi}
+  onChangeEntity={(next) => {
+    setSelectedCategories([]);
+    setSelectedSubcategories([]);
+    setExpandedIds(new Set());
+    setTree([]);
+    setTableTree([]);
+    setDictRowsAll([]);
+    setDiagnostics(null);
+    setError(null);
+    setLastUpdated(null);
+    setEntity(next);
+    setChartsActive(false);
+    resetChartsState();
+    setCgimActive(false);
+  }}
 
-      if (delayBetweenChunksMs > 0) {
-        await sleep(delayBetweenChunksMs);
-      }
+  year={year}
+  years={years}
+  onChangeYear={(next) => {
+    setYear(next);
+    setChartsActive(false);
+    resetChartsState();
+    setCgimActive(false);
+  }}
 
-      let meta = await comexGeneralRequestWithMeta(payload);
-
-      // ✅ Modo CGIM leve: backoff simples em 429 (rate limit)
-      if (!meta.ok && meta.status === 429 && retry429WaitMs > 0) {
-        await sleep(retry429WaitMs);
-        meta = await comexGeneralRequestWithMeta(payload);
-      }
-
-      const rows = meta.rows || [];
-
-      for (const r of rows ?? []) {
-        const rawNcm =
-          r?.noNcmpt ??
-          r?.noNcm ??
-          r?.coNcm ??
-          r?.co_ncm ??
-          r?.ncm ??
-          r?.details?.noNcmpt ??
-          r?.details?.noNcm ??
-          r?.details?.coNcm ??
-          r?.details?.co_ncm ??
-          r?.details?.ncm;
-
-        const ncm = normalizeNcmTo8(rawNcm);
-        if (!ncm) continue;
-
-        const fob = Number(r?.metricFOB ?? r?.vlFob ?? r?.vl_fob ?? r?.fob ?? 0) || 0;
-        const kg = Number(r?.metricKG ?? r?.kgLiquido ?? r?.kg_liquido ?? r?.kg ?? 0) || 0;
-
-        results.push({ ncm, fob, kg });
-      }
-
-      // PERF: atualiza progresso ao concluir este chunk (conta NCMs, não requests)
-      done += thisChunk.length;
-      if (args.onProgress) {
-        args.onProgress({ done, total, chunk: myIdx + 1, chunks: chunks.length });
-      }
+  flow={CGIM_TEST_MODE === 1 ? "import" : flow}
+  onChangeFlow={(next) => {
+    if (CGIM_TEST_MODE === 1) {
+      setFlow("import");
+      setChartsActive(false);
+      resetChartsState();
+      setCgimActive(false);
+      return;
     }
-  };
+    setFlow(next);
+    setChartsActive(false);
+    resetChartsState();
+    setCgimActive(false);
+  }}
 
-  const concurrency = Math.max(1, Math.min(maxConcurrency, chunks.length));
-  const workers = Array.from({ length: concurrency }, () => worker());
+  viewMode={viewMode}
+  onChangeViewMode={(next) => setViewMode(next)}
 
-  await Promise.allSettled(workers);
+  detailLevel={detailLevel as any}
+  onChangeDetailLevel={(next) => setDetailLevel(next as any)}
 
-  return results;
-}
+  subcatDepth={subcatDepth}
+  maxSubcatDepth={maxSubcatDepth}
+  onChangeSubcatDepth={(next) => {
+    setSelectedSubcategories([]);
+    setSubcatDepth(next);
+  }}
 
-// =====================================================
-// PERF: Séries anuais em 1 chamada (quando possível)
-// - Objetivo: reduzir drasticamente /general em gráficos (evita ano-a-ano)
-// - Mantém compatibilidade: se a API não devolver "ano" por linha, o caller pode fazer fallback.
-// =====================================================
-export async function fetchComexAnnualSeriesByNcmList(args: {
-  yearStart: number | string;
-  yearEnd: number | string;
-  flow: "import" | "export";
-  ncms: string[];
-  lite?: boolean;
-  onProgress?: (info: { done: number; total: number; chunk: number; chunks: number }) => void;
-}): Promise<Array<{ year: number; fob: number; kg: number }> | null> {
-  const y0 = Number(args.yearStart);
-  const y1 = Number(args.yearEnd);
+  total={total}
+  formatFOB={formatMoneyUS}
+  formatKG={formatKg}
+  formatUsdPerTon={formatUsdPerTonTable}
 
-  const ncms8 = (args.ncms ?? [])
-    .map((n) => normalizeNcmTo8(n))
-    .filter((x): x is string => Boolean(x));
+  diagnostics={diagnostics as any}
 
-  if (!Number.isFinite(y0) || !Number.isFinite(y1) || !ncms8.length) return [];
+  availableCategories={availableCategories}
+  availableSubcategories={availableSubcategories}
 
-  const flow: TradeFlow =
-    args.flow === "export" ? "exp" : args.flow === "import" ? "imp" : (args.flow as TradeFlow);
+  selectedCategories={selectedCategories}
+  selectedSubcategories={selectedSubcategories}
+  onChangeSelectedCategories={(next) => {
+    setSelectedCategories(next);
+    setSelectedSubcategories([]);
+  }}
+  onChangeSelectedSubcategories={(next) => setSelectedSubcategories(next)}
 
-  const lite = Boolean(args.lite);
+  onExpandAll={() => expandAll()}
+  onCollapseAll={() => collapseAll()}
+  onResetFilters={() => resetFilters()}
 
-  const chunk = <T,>(arr: T[], size: number): T[][] => {
-    const out: T[][] = [];
-    for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
-    return out;
-  };
+  error={error}
+  truncateLabel={truncateLabel}
+/>
+{/* Gráficos anuais + composição (extraído) */}
+      <CgimAnnualChartsPanel
+        cardStyle={cardStyle}
+        sourceFooterStyle={sourceFooterStyle}
+        basketLabel={basketLabel}
+        chartsLoading={chartsLoading}
+        chartsError={chartsError}
+        annualImportSeries={annualImportSeries}
+        annualExportSeries={annualExportSeries}
+        annualPriceIeSeries={annualPriceIeSeries}
+        annualBalanceSeriesSigned={annualBalanceSeriesSigned}
+        balanceMaxAbs={balanceMaxAbs}
+        tickKg={tickKg}
+        tickFob={tickFob}
+        tickPrice={tickPrice}
+        categoryBars={categoryBars}
+        subcatBars={subcatBars}
+        categoryBarsKg={categoryBarsKg}
+        subcatBarsKg={subcatBarsKg}
+        compositionCategoryTextFob={compositionCategoryTextFob}
+        compositionSubcategoryTextFob={compositionSubcategoryTextFob}
+        compositionCategoryTextKg={compositionCategoryTextKg}
+        compositionSubcategoryTextKg={compositionSubcategoryTextKg}
+      />
 
-  // Mesmo critério do year-by-year, mas aqui tentamos 1 request por chunk cobrindo todo o período
-  const chunkSize = lite ? 20 : CGIM_MAX_NCMS_PER_REQUEST;
-  const maxConcurrency = lite ? 1 : CGIM_MAX_CONCURRENCY;
 
-  const chunks = chunk(ncms8, chunkSize);
-  const total = ncms8.length;
+      {(viewMode === "TABLE" || viewMode === "BOTH") && (
+        <div style={cardStyle}>
+          <div
+            style={{
+              display: "flex",
+              justifyContent: "space-between",
+              alignItems: "baseline",
+              marginBottom: 10,
+            }}
+          >
+            <div style={{ fontWeight: 900 }}>Estrutura agregada</div>
+            <div style={{ fontSize: 12, opacity: 0.7 }}>
+              Ordenação: {sortKey.toUpperCase()} ({sortDir})
+            </div>
+          </div>
 
-  // Acumula por ano ao longo de todos os chunks
-  const byYear = new Map<number, { fob: number; kg: number }>();
+          <CgimHierarchyTable
+            tree={tableTree}
+            detailLevel={detailLevel}
+            selectedCategories={selectedCategories}
+            selectedSubcategories={selectedSubcategories}
+            expandedIds={expandedIds}
+            onToggleExpand={(id) => {
+              setExpandedIds((prev) => {
+                const next = new Set(prev);
+                if (next.has(id)) next.delete(id);
+                else next.add(id);
+                return next;
+              });
+            }}
+            sortKey={sortKey}
+            sortDir={sortDir}
+            onChangeSort={(k) => {
+              setSortKey((prevKey) => {
+                if (prevKey !== k) {
+                  setSortDir("desc");
+                  return k;
+                }
+                setSortDir((d) => (d === "desc" ? "asc" : "desc"));
+                return prevKey;
+              });
+            }}
+            formatFOB={formatMoneyUS}
+            formatKG={formatKg}
+          />
+        </div>
+      )}
+    </div>
+    </>
+  );
 
-  // Helper de leitura de ano (robusto)
-  const pickYear = (r: any): number | null => {
-    const candidates = [
-      r?.year,
-      r?.ano,
-      r?.coAno,
-      r?.co_ano,
-      r?.noAno,
-      r?.no_ano,
-      r?.details?.year,
-      r?.details?.ano,
-      r?.details?.coAno,
-      r?.details?.co_ano,
-      r?.details?.noAno,
-      r?.details?.no_ano,
-    ];
-    for (const c of candidates) {
-      const n = Number(c);
-      if (Number.isFinite(n) && n > 1900) return n;
-    }
-    return null;
-  };
-
-  const idxRef = { i: 0 };
-  let done = 0;
-  let sawAnyYear = false;
-
-  const worker = async () => {
-    while (idxRef.i < chunks.length) {
-      const myIdx = idxRef.i++;
-      const thisChunk = chunks[myIdx];
-
-      // Tentativa 1: pedir detalhamento por ano (mais barato que ano-a-ano)
-      // Observação: a API ComexStat pode devolver o ano em diferentes campos dependendo do backend.
-      // Mantemos uma tentativa conservadora: detailDatabase com "coAno".
-      const payload: any = {
-        yearStart: String(y0),
-        yearEnd: String(y1),
-        typeForm: toApiTypeForm(flow),
-        typeOrder: 1,
-        filterList: [{ id: "coNcm" }],
-        filterArray: [{ item: thisChunk, idInput: "coNcm" }],
-        // PERF: tentamos agrupar por ano (se o backend suportar)
-        detailDatabase: [{ id: "coAno", text: "" }],
-        monthDetail: false,
-        metricFOB: true,
-        metricKG: true,
-        metricStatistic: false,
-        monthStart: "01",
-        monthEnd: "12",
-        formQueue: "general",
-        langDefault: "pt",
-      };
-
-      const meta = await comexGeneralRequestWithMeta(payload);
-      const rows = meta.rows || [];
-
-      for (const r of rows ?? []) {
-        const y = pickYear(r);
-        if (!y) continue;
-        sawAnyYear = true;
-
-        const fob = Number(r?.metricFOB ?? r?.vlFob ?? r?.vl_fob ?? r?.fob ?? 0) || 0;
-        const kg = Number(r?.metricKG ?? r?.kgLiquido ?? r?.kg_liquido ?? r?.kg ?? 0) || 0;
-
-        const cur = byYear.get(y) ?? { fob: 0, kg: 0 };
-        cur.fob += fob;
-        cur.kg += kg;
-        byYear.set(y, cur);
-      }
-
-      done += thisChunk.length;
-      if (args.onProgress) args.onProgress({ done, total, chunk: myIdx + 1, chunks: chunks.length });
-    }
-  };
-
-  const concurrency = Math.max(1, Math.min(maxConcurrency, chunks.length));
-  const workers = Array.from({ length: concurrency }, () => worker());
-
-  await Promise.allSettled(workers);
-
-  // Se não vimos nenhum ano (API não retornou por ano), pedimos para o caller fazer fallback seguro (ano-a-ano)
-  if (!sawAnyYear) return null;
-
-  const out: Array<{ year: number; fob: number; kg: number }> = [];
-  for (let y = y0; y <= y1; y++) {
-    const cur = byYear.get(y) ?? { fob: 0, kg: 0 };
-    out.push({ year: y, fob: cur.fob, kg: cur.kg });
-  }
-
-  return out;
 }
