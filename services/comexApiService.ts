@@ -151,8 +151,10 @@ function sleep(ms: number): Promise<void> {
 // - cache curto em memória (evita refetch do mesmo payload imediatamente)
 // ==================
 const GENERAL_CONCURRENCY = 1; // ajuste mínimo; 1 = mais lento, mas quase sem 429
-const GENERAL_MIN_INTERVAL_MS = 3500; // espaçamento mínimo entre POST /general (reduz 429; pode aumentar)
+const GENERAL_MIN_INTERVAL_MS = 12000; // MODO 1: espaçamento mais conservador // espaçamento mínimo entre POST /general (reduz 429; pode aumentar)
 let lastGeneralRequestAt = 0;
+let generalCooldownUntil = 0; // epoch ms: quando houver 429, bloqueia novas chamadas até este instante
+
 let generalActive = 0;
 const generalQueue: Array<() => void> = [];
 
@@ -161,6 +163,12 @@ async function withGeneralSlot<T>(fn: () => Promise<T>): Promise<T> {
     await new Promise<void>((resolve) => generalQueue.push(resolve));
   }
   generalActive++;
+  // 🔧 MODO 1: respeita janela de cooldown após 429
+  const cdNow = Date.now();
+  if (generalCooldownUntil && cdNow < generalCooldownUntil) {
+    await sleep(generalCooldownUntil - cdNow);
+  }
+
   // 🔧 AÇÃO MÍNIMA: espaça requisições /general para reduzir 429 (API pede ~10s em caso de limite)
   const now = Date.now();
   const diff = now - lastGeneralRequestAt;
@@ -432,7 +440,7 @@ async function comexGeneralRequestWithMeta(payload: any, timeoutMs = DEFAULT_TIM
     }
 
     const promise = withGeneralSlot(async () => {
-      const MAX_RETRIES_429 = 8;
+      const MAX_RETRIES_429 = 1; // MODO 1: no máximo 1 retentativa para não 'martelar' a API
 
       for (let attempt = 0; attempt <= MAX_RETRIES_429; attempt++) {
         const res = await fetchWithTimeout(url, timeoutMs, {
@@ -445,14 +453,14 @@ async function comexGeneralRequestWithMeta(payload: any, timeoutMs = DEFAULT_TIM
           // tenta respeitar Retry-After se vier; senão aplica backoff progressivo com jitter
           const ra = res.headers?.get?.("Retry-After");
           const raMs = ra ? Number(ra) * 1000 : NaN;
-          const base = Number.isFinite(raMs) && raMs > 0 ? raMs : 12_000;
+          const base = Number.isFinite(raMs) && raMs > 0 ? raMs : 20_000;
           const backoff = base * Math.min(6, Math.max(1, attempt + 1)); // 12s, 24s, 36s... (cap)
           const jitter = Math.floor(Math.random() * 1500);
           const waitMs = backoff + jitter;
           const txt429 = await res.text().catch(() => "");
           console.warn("[comexApiService] 429 em /general. Aguardando", waitMs, "ms. Detalhe:", txt429);
+          generalCooldownUntil = Date.now() + waitMs;
           await sleep(waitMs);
-          continue;
           continue;
         }
 
@@ -901,12 +909,10 @@ export async function fetchComexYearByNcmList(args: {
   // ---- execução com limite de concorrência ----
   const lite = Boolean(args.lite);
 
-  const chunkSize = lite ? 80 : CGIM_MAX_NCMS_PER_REQUEST;
+  const chunkSize = lite ? 20 : CGIM_MAX_NCMS_PER_REQUEST;
   const maxConcurrency = lite ? 1 : CGIM_MAX_CONCURRENCY;
-  // Em produção (Netlify), preferimos MENOS requests (chunks maiores) + pacing explícito
-  const delayBetweenChunksMs = lite ? 900 : 0;
-  // Backoff mais conservador em 429
-  const retry429WaitMs = lite ? 15_000 : 0;
+  const delayBetweenChunksMs = lite ? 500 : 0;
+  const retry429WaitMs = lite ? 11_000 : 0;
 
   const chunks = chunk(ncms8, chunkSize);
 
