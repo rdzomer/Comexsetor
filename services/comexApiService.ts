@@ -910,10 +910,10 @@ export async function fetchComexYearByNcmList(args: {
 
   const results: NcmYearRow[] = [];
   let idx = 0;
-  // PERF: progresso em NCMs processados (não requests)
-  let doneNcms = 0;
-  const totalNcms = chunks.reduce((acc, c) => acc + c.length, 0);
-  if (args.onProgress) args.onProgress({ done: 0, total: totalNcms, chunk: 0, chunks: chunks.length });
+
+  // PERF: progresso por NCM (para barra dinâmica na UI)
+  const total = ncms8.length;
+  let done = 0;
 
   const worker = async () => {
     while (idx < chunks.length) {
@@ -974,10 +974,10 @@ export async function fetchComexYearByNcmList(args: {
         results.push({ ncm, fob, kg });
       }
 
-      // PERF: atualiza progresso ao concluir este chunk
-      doneNcms += thisChunk.length;
+      // PERF: atualiza progresso ao concluir este chunk (conta NCMs, não requests)
+      done += thisChunk.length;
       if (args.onProgress) {
-        args.onProgress({ done: Math.min(doneNcms, totalNcms), total: totalNcms, chunk: myIdx + 1, chunks: chunks.length });
+        args.onProgress({ done, total, chunk: myIdx + 1, chunks: chunks.length });
       }
     }
   };
@@ -988,4 +988,140 @@ export async function fetchComexYearByNcmList(args: {
   await Promise.allSettled(workers);
 
   return results;
+}
+
+// =====================================================
+// PERF: Séries anuais em 1 chamada (quando possível)
+// - Objetivo: reduzir drasticamente /general em gráficos (evita ano-a-ano)
+// - Mantém compatibilidade: se a API não devolver "ano" por linha, o caller pode fazer fallback.
+// =====================================================
+export async function fetchComexAnnualSeriesByNcmList(args: {
+  yearStart: number | string;
+  yearEnd: number | string;
+  flow: "import" | "export";
+  ncms: string[];
+  lite?: boolean;
+  onProgress?: (info: { done: number; total: number; chunk: number; chunks: number }) => void;
+}): Promise<Array<{ year: number; fob: number; kg: number }> | null> {
+  const y0 = Number(args.yearStart);
+  const y1 = Number(args.yearEnd);
+
+  const ncms8 = (args.ncms ?? [])
+    .map((n) => normalizeNcmTo8(n))
+    .filter((x): x is string => Boolean(x));
+
+  if (!Number.isFinite(y0) || !Number.isFinite(y1) || !ncms8.length) return [];
+
+  const flow: TradeFlow =
+    args.flow === "export" ? "exp" : args.flow === "import" ? "imp" : (args.flow as TradeFlow);
+
+  const lite = Boolean(args.lite);
+
+  const chunk = <T,>(arr: T[], size: number): T[][] => {
+    const out: T[][] = [];
+    for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
+    return out;
+  };
+
+  // Mesmo critério do year-by-year, mas aqui tentamos 1 request por chunk cobrindo todo o período
+  const chunkSize = lite ? 20 : CGIM_MAX_NCMS_PER_REQUEST;
+  const maxConcurrency = lite ? 1 : CGIM_MAX_CONCURRENCY;
+
+  const chunks = chunk(ncms8, chunkSize);
+  const total = ncms8.length;
+
+  // Acumula por ano ao longo de todos os chunks
+  const byYear = new Map<number, { fob: number; kg: number }>();
+
+  // Helper de leitura de ano (robusto)
+  const pickYear = (r: any): number | null => {
+    const candidates = [
+      r?.year,
+      r?.ano,
+      r?.coAno,
+      r?.co_ano,
+      r?.noAno,
+      r?.no_ano,
+      r?.details?.year,
+      r?.details?.ano,
+      r?.details?.coAno,
+      r?.details?.co_ano,
+      r?.details?.noAno,
+      r?.details?.no_ano,
+    ];
+    for (const c of candidates) {
+      const n = Number(c);
+      if (Number.isFinite(n) && n > 1900) return n;
+    }
+    return null;
+  };
+
+  const idxRef = { i: 0 };
+  let done = 0;
+  let sawAnyYear = false;
+
+  const worker = async () => {
+    while (idxRef.i < chunks.length) {
+      const myIdx = idxRef.i++;
+      const thisChunk = chunks[myIdx];
+
+      // Tentativa 1: pedir detalhamento por ano (mais barato que ano-a-ano)
+      // Observação: a API ComexStat pode devolver o ano em diferentes campos dependendo do backend.
+      // Mantemos uma tentativa conservadora: detailDatabase com "coAno".
+      const payload: any = {
+        yearStart: String(y0),
+        yearEnd: String(y1),
+        typeForm: toApiTypeForm(flow),
+        typeOrder: 1,
+        filterList: [{ id: "coNcm" }],
+        filterArray: [{ item: thisChunk, idInput: "coNcm" }],
+        // PERF: tentamos agrupar por ano (se o backend suportar)
+        detailDatabase: [{ id: "coAno", text: "" }],
+        monthDetail: false,
+        metricFOB: true,
+        metricKG: true,
+        metricStatistic: false,
+        monthStart: "01",
+        monthEnd: "12",
+        formQueue: "general",
+        langDefault: "pt",
+      };
+
+      const meta = await comexGeneralRequestWithMeta(payload);
+      const rows = meta.rows || [];
+
+      for (const r of rows ?? []) {
+        const y = pickYear(r);
+        if (!y) continue;
+        sawAnyYear = true;
+
+        const fob = Number(r?.metricFOB ?? r?.vlFob ?? r?.vl_fob ?? r?.fob ?? 0) || 0;
+        const kg = Number(r?.metricKG ?? r?.kgLiquido ?? r?.kg_liquido ?? r?.kg ?? 0) || 0;
+
+        const cur = byYear.get(y) ?? { fob: 0, kg: 0 };
+        cur.fob += fob;
+        cur.kg += kg;
+        byYear.set(y, cur);
+      }
+
+      done += thisChunk.length;
+      if (args.onProgress) args.onProgress({ done, total, chunk: myIdx + 1, chunks: chunks.length });
+    }
+  };
+
+  const concurrency = Math.max(1, Math.min(maxConcurrency, chunks.length));
+  const workers = Array.from({ length: concurrency }, () => worker());
+
+  await Promise.allSettled(workers);
+
+  // Se não vimos nenhum ano (API não retornou por ano), pedimos para o caller fazer fallback seguro (ano-a-ano)
+  if (!sawAnyYear) return null;
+
+  const out: Array<{ year: number; fob: number; kg: number }> = [];
+  for (let y = y0; y <= y1; y++) {
+    const cur = byYear.get(y) ?? { fob: 0, kg: 0 };
+    out.push({ year: y, fob: cur.fob, kg: cur.kg });
+  }
+
+  return out;
 }
