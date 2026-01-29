@@ -653,12 +653,14 @@ export default function CgimAnalyticsPage() {
   }, []);
 
   // entities pack
+  // PERF/FIX: este efeito só serve para popular a lista do seletor.
+  // Não deve depender de "requestId" (variável inexistente aqui) nem de estados de gráficos.
   React.useEffect(() => {
     let cancelled = false;
     async function loadEntitiesFromExcel() {
       try {
         const pack = await cgimDictionaryService.loadCgimDictionaryFromExcel();
-        if (cancelled || chartsRequestIdRef.current !== requestId) return;
+        if (cancelled) return;
         const list = (pack.entities ?? []).filter(Boolean);
         if (list.length) {
           // Mantém lista para o select, mas NÃO auto-seleciona entidade.
@@ -692,7 +694,8 @@ export default function CgimAnalyticsPage() {
       setTableTree([]);
       setExpandedIds(new Set());
       setDiagnostics(null);
-      setError(null);
+	    // PERF/FIX: manter indentação e garantir reset de erro antes do fetch
+	    setError(null);
       setLastUpdated(null);
 
         setLoading(true);
@@ -793,7 +796,8 @@ export default function CgimAnalyticsPage() {
       onProgress: ({ done }) => setProgress({ done, total: Math.max(1, ncmsAllUnique.length * 2) }),
     });
 
-    if (cancelled || chartsRequestIdRef.current !== requestId) return;
+	    // PERF/FIX: evita atualização por efeito antigo (stale) sem depender de requestId de gráficos
+	    if (cancelled || inFlightTableKeyRef.current !== tableKey) return;
 
     const exportRaw = await fetchComexYearByNcmList({
       year: String(year),
@@ -803,7 +807,7 @@ export default function CgimAnalyticsPage() {
       onProgress: ({ done, total }) => setProgress({ done: done + ncmsAllUnique.length, total: ncmsAllUnique.length * 2 }),
     });
 
-    if (cancelled || chartsRequestIdRef.current !== requestId) return;
+	    if (cancelled || inFlightTableKeyRef.current !== tableKey) return;
 
     const basketImportRows = importRaw.map((r: any) => ({
       ncm: String(r.ncm ?? r.noNcmpt ?? r.coNcm ?? "").replace(/\D/g, ""),
@@ -879,8 +883,8 @@ export default function CgimAnalyticsPage() {
         setTableTree(mergeImpExpTrees(importTree, exportTree));
         setLastUpdated(new Date());
         setExpandedIds(new Set());
-      } catch (e: any) {
-        if (cancelled || chartsRequestIdRef.current !== requestId) return;
+	      } catch (e: any) {
+	        if (cancelled || inFlightTableKeyRef.current !== tableKey) return;
         setError(e?.message ? String(e.message) : "Erro ao carregar dados.");
       } finally {
         // libera lock de fetch
