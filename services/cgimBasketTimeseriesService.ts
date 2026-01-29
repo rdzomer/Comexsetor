@@ -1,5 +1,5 @@
 // services/cgimBasketTimeseriesService.ts
-import { fetchComexYearByNcmList, type TradeFlowUi } from "./comexApiService";
+import { fetchAggregatedSeriesByNcmList, type TradeFlow, type TradeFlowUi } from "./comexApiService";
 
 export type BasketAnnualPoint = {
   year: number;
@@ -8,125 +8,85 @@ export type BasketAnnualPoint = {
   usdPerTon: number;
 };
 
-function toNumber(v: any): number {
-  const n = Number(v);
-  return Number.isFinite(n) ? n : 0;
-}
+// Configuração de Chunking para evitar "URI Too Long" ou 429 no filtro
+const NCM_CHUNK_SIZE = 500; 
 
-function pickYear(r: any): number | null {
-  const candidates = [
-    r?.year,
-    r?.ano,
-    r?.coAno,
-    r?.co_ano,
-    r?.noAno,
-    r?.no_ano,
-  ];
-  for (const c of candidates) {
-    const n = Number(c);
-    if (Number.isFinite(n) && n > 1900) return n;
-  }
-  return null;
-}
-
-function pickFOB(r: any): number {
-  return toNumber(r?.metricFOB ?? r?.vlFob ?? r?.vl_fob ?? r?.fob);
-}
-
-function pickKG(r: any): number {
-  return toNumber(r?.metricKG ?? r?.kgLiquido ?? r?.kg_liquido ?? r?.kg);
-}
-
-function cacheKey(flow: TradeFlowUi, yearStart: number, yearEnd: number, ncms: string[]) {
-  // key curta (hash simples)
-  const joined = (ncms || []).slice().sort().join(",");
-  let h = 0;
-  for (let i = 0; i < joined.length; i++) h = (h * 31 + joined.charCodeAt(i)) >>> 0;
-  return `cgim:basket:annual:${flow}:${yearStart}-${yearEnd}:${h}:${ncms.length}`;
-}
-
-function getCache(key: string, ttlHours = 24): BasketAnnualPoint[] | null {
-  try {
-    const raw = localStorage.getItem(key);
-    if (!raw) return null;
-    const obj = JSON.parse(raw) as { ts: number; data: BasketAnnualPoint[] };
-    if (!obj?.ts || !Array.isArray(obj.data)) return null;
-    if (Date.now() - obj.ts > ttlHours * 3600_000) return null;
-    return obj.data;
-  } catch {
-    return null;
-  }
-}
-
-function setCache(key: string, data: BasketAnnualPoint[]) {
-  try {
-    localStorage.setItem(key, JSON.stringify({ ts: Date.now(), data }));
-  } catch {
-    // ignore
-  }
+function getTradeFlow(uiFlow: TradeFlowUi): TradeFlow {
+  return uiFlow === "import" ? "imp" : "exp";
 }
 
 export async function fetchBasketAnnualSeries(args: {
-  flow: TradeFlowUi;           // "import" | "export"
-  yearStart: number;           // ex 2015
-  yearEnd: number;             // ex 2025
-  ncms: string[];              // NCMs 8 dígitos
-  useCache?: boolean;
-  cacheTtlHours?: number;
+  entityName: string; // Usado para cache key
+  flowUi: TradeFlowUi;
+  yearStart: number;
+  yearEnd: number;
+  ncms: string[];
 }): Promise<BasketAnnualPoint[]> {
-  const flow = args.flow;
-  const yearStart = Number(args.yearStart);
-  const yearEnd = Number(args.yearEnd);
-  const ncms = (args.ncms || []).filter(Boolean);
+  const { flowUi, yearStart, yearEnd, ncms } = args;
+  
+  if (!ncms || ncms.length === 0) return [];
 
-  if (!ncms.length) return [];
+  // 1. Gera lista de anos
+  const years: number[] = [];
+  for (let y = yearStart; y <= yearEnd; y++) years.push(y);
 
-  const key = cacheKey(flow, yearStart, yearEnd, ncms);
-  const useCache = args.useCache ?? true;
-  const ttl = args.cacheTtlHours ?? 24;
-
-  if (useCache) {
-    const cached = getCache(key, ttl);
-    if (cached) return cached;
+  // 2. Cache Key (Simples)
+  const cacheKey = `cgim_series_v2_${args.entityName}_${flowUi}_${yearStart}_${yearEnd}_${ncms.length}`;
+  const cached = sessionStorage.getItem(cacheKey);
+  if (cached) {
+    console.log(`[TimeSeries] Cache Hit para ${args.entityName}`);
+    return JSON.parse(cached);
   }
 
-  // ✅ Evita 429 (rate limit) no modo “cesta completa”:
-  // ao invés de um POST gigante com todos os NCMs + vários anos,
-  // buscamos ano a ano usando o helper já chunkado (fetchComexYearByNcmList).
-  const out: BasketAnnualPoint[] = [];
+  // 3. Prepara Chunks de NCM
+  const chunks: string[][] = [];
+  for (let i = 0; i < ncms.length; i += NCM_CHUNK_SIZE) {
+    chunks.push(ncms.slice(i, i + NCM_CHUNK_SIZE));
+  }
 
-  // ✅ Robustez: séries anuais chamam /general várias vezes (ano a ano).
-// Para evitar 429 em produção, forçamos "lite" quando a cesta é média/grande e aplicamos delay fixo.
-const lite = ncms.length > 25;
-const delayMs = lite ? 750 : 250;
+  console.log(`[TimeSeries] Buscando série ${yearStart}-${yearEnd} para ${ncms.length} NCMs em ${chunks.length} lotes.`);
 
-  for (let y = yearStart; y <= yearEnd; y++) {
-    if (delayMs) {
-      await new Promise((r) => setTimeout(r, delayMs));
+  // 4. Executa requisições (Agregadas por Ano)
+  // Usamos Promise.all para disparar os chunks em paralelo (limitado pelo navegador)
+  // Como cada request retorna SÓ os totais anuais, é leve.
+  
+  const flow = getTradeFlow(flowUi);
+  const promises = chunks.map(chunk => 
+    fetchAggregatedSeriesByNcmList({ flow, years, ncms: chunk })
+  );
+
+  const results = await Promise.all(promises);
+
+  // 5. Consolida os resultados (Soma os chunks)
+  const totalsByYear = new Map<number, { fob: number; kg: number }>();
+
+  // Inicializa mapa com zeros para garantir que todos anos apareçam (inclusive vazios)
+  years.forEach(y => totalsByYear.set(y, { fob: 0, kg: 0 }));
+
+  results.flat().forEach(row => {
+    const current = totalsByYear.get(row.year);
+    if (current) {
+      current.fob += row.fob;
+      current.kg += row.kg;
     }
+  });
 
-    const rows = await fetchComexYearByNcmList({
-      flow,
-      year: y,
-      ncms,
-      lite,
-    });
+  // 6. Formata saída final
+  const output: BasketAnnualPoint[] = Array.from(totalsByYear.entries())
+    .sort((a, b) => a[0] - b[0]) // Ordena por ano
+    .map(([year, val]) => ({
+      year,
+      fob: val.fob,
+      kg: val.kg,
+      usdPerTon: val.kg > 0 ? val.fob / val.kg : 0
+    }));
 
-    let fob = 0;
-    let kg = 0;
-    for (const r of rows || []) {
-      fob += Number(r?.fob ?? 0) || 0;
-      kg += Number(r?.kg ?? 0) || 0;
-    }
-
-    const usdPerTon = kg > 0 ? fob / (kg / 1000) : 0;
-    out.push({ year: y, fob, kg, usdPerTon });
+  // 7. Salva no Cache
+  try {
+    sessionStorage.setItem(cacheKey, JSON.stringify(output));
+  } catch (e) {
+    console.warn("Storage cheio, ignorando cache de série.");
   }
 
-  // ✅ não cachear vazio (evita “congelar” falha / rate limit)
-  if (useCache && out.some((p) => (p.fob ?? 0) !== 0 || (p.kg ?? 0) !== 0)) {
-    setCache(key, out);
-  }
-
-  return out;
+  return output;
 }
