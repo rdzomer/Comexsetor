@@ -564,8 +564,6 @@ export default function CgimAnalyticsPage() {
   // ✅ Evita múltiplos fetches simultâneos (React StrictMode / cliques rápidos)
   const inFlightTableKeyRef = React.useRef<string | null>(null);
   const inFlightChartsKeyRef = React.useRef<string | null>(null);
-  // PERF/UX: invalida respostas atrasadas de gráficos ao trocar contexto (entidade/ano/fluxo)
-  const chartsRequestIdRef = React.useRef<number>(0);
 
   const [tree, setTree] = React.useState<HierarchyNode[]>([]);
   const [tableTree, setTableTree] = React.useState<any[]>([]);
@@ -610,42 +608,6 @@ export default function CgimAnalyticsPage() {
     duplicateNcms: number;
     conflictingMappings: number;
   } | null>(null);
-
-  // PERF/UX: limpa séries de gráficos para evitar 'vazamento' de dados ao trocar entidade/ano/fluxo
-  const resetChartsState = React.useCallback(() => {
-    // desativa o gate e limpa locks
-    setChartsActive(false);
-    inFlightChartsKeyRef.current = null;
-    // invalida qualquer resposta em andamento
-    chartsRequestIdRef.current += 1;
-    // limpa estados de gráficos
-    setChartsLoading(false);
-    setChartsError(null);
-    setAnnualSeries([]);
-    setAnnualImportSeries([]);
-    setAnnualExportSeries([]);
-    setAnnualBalanceSeries([]);
-    setAnnualPriceIeSeries([]);
-    setAnnualPriceSeries([]);
-    setCategoryBars([]);
-    setSubcatBars([]);
-    setCategoryBarsKg([]);
-    setSubcatBarsKg([]);
-  }, [
-    setChartsActive,
-    setChartsLoading,
-    setChartsError,
-    setAnnualSeries,
-    setAnnualImportSeries,
-    setAnnualExportSeries,
-    setAnnualBalanceSeries,
-    setAnnualPriceIeSeries,
-    setAnnualPriceSeries,
-    setCategoryBars,
-    setSubcatBars,
-    setCategoryBarsKg,
-    setSubcatBarsKg,
-  ]);
 
   const loadDictionary = React.useMemo(() => {
     return pickFn<
@@ -787,31 +749,38 @@ export default function CgimAnalyticsPage() {
 
         // força a barra a aparecer imediatamente
         // loading já está true aqui; mantido apenas por clareza
+    
     setError(null);
-        setProgress({ done: 0, total: Math.max(1, ncmsAllUnique.length * 2) });
 
-    // Busca Comex (ano cheio) para TODOS os NCMs únicos com chunking (bem menos requests)
-    const importRaw = await fetchComexYearByNcmList({
-      year: String(year),
-      flow: "import",
-      ncms: ncmsAllUnique,
-      lite: useLite,
-      onProgress: ({ done }) => setProgress({ done, total: Math.max(1, ncmsAllUnique.length * 2) }),
-    });
+    // PERF: progresso deve refletir apenas o fluxo selecionado (evita "dobrar" o total).
+    const totalNcms = Math.max(1, ncmsAllUnique.length);
+    setProgress({ done: 0, total: totalNcms });
+
+    // Busca Comex (ano cheio) apenas para o fluxo selecionado.
+    let importRaw: any[] = [];
+    let exportRaw: any[] = [];
+
+    if (flow === "import") {
+      importRaw = await fetchComexYearByNcmList({
+        year: String(year),
+        flow: "import",
+        ncms: ncmsAllUnique,
+        lite: useLite,
+        onProgress: ({ done }) => setProgress({ done, total: totalNcms }),
+      });
+    } else {
+      exportRaw = await fetchComexYearByNcmList({
+        year: String(year),
+        flow: "export",
+        ncms: ncmsAllUnique,
+        lite: useLite,
+        onProgress: ({ done }) => setProgress({ done, total: totalNcms }),
+      });
+    }
 
     if (cancelled) return;
 
-    const exportRaw = await fetchComexYearByNcmList({
-      year: String(year),
-      flow: "export",
-      ncms: ncmsAllUnique,
-      lite: useLite,
-      onProgress: ({ done, total }) => setProgress({ done: done + ncmsAllUnique.length, total: ncmsAllUnique.length * 2 }),
-    });
-
-    if (cancelled) return;
-
-    const basketImportRows = importRaw.map((r: any) => ({
+const basketImportRows = importRaw.map((r: any) => ({
       ncm: String(r.ncm ?? r.noNcmpt ?? r.coNcm ?? "").replace(/\D/g, ""),
       fob: Number(r.fob ?? r.metricFOB ?? r.vlFob ?? 0) || 0,
       kg: Number(r.kg ?? r.metricKG ?? r.kgLiquido ?? 0) || 0,
@@ -905,12 +874,6 @@ export default function CgimAnalyticsPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [cgimActive, entity, year, flow, subcatDepth]);
 
-  // PERF/UX: ao mudar entidade/ano/fluxo, não reaproveitar séries antigas e exigir clique de 'Carregar gráficos' novamente
-  React.useEffect(() => {
-    resetChartsState();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [entity, year, flow]);
-
   const availableCategories = React.useMemo(() => listCategories(tree), [tree]);
   const availableSubcategories = React.useMemo(
     () => listSubcategories(tree, selectedCategories),
@@ -930,7 +893,6 @@ export default function CgimAnalyticsPage() {
       if (!cgimActive || !entity || !chartsActive) return;
       if (inFlightChartsKeyRef.current === chartsKey) return;
       inFlightChartsKeyRef.current = chartsKey;
-      const myChartsReqId = ++chartsRequestIdRef.current; // PERF/UX: identifica esta execução
 
       if (!dictRowsAll.length) {
         setAnnualSeries([]);
@@ -939,7 +901,6 @@ export default function CgimAnalyticsPage() {
           setSubcatBars([]);
           setCategoryBarsKg([]);
           setSubcatBarsKg([]);
-        inFlightChartsKeyRef.current = null;
         return;
       }
 
@@ -958,7 +919,6 @@ export default function CgimAnalyticsPage() {
           setAnnualPriceSeries([]);
           setCategoryBars([]);
           setSubcatBars([]);
-          inFlightChartsKeyRef.current = null;
           return;
         }
 
@@ -978,7 +938,7 @@ export default function CgimAnalyticsPage() {
             useCache: true,
             cacheTtlHours: 24,
         });
-        if (cancelled || myChartsReqId !== chartsRequestIdRef.current) return;
+        if (cancelled) return;
         // 🕒 Espaçamento entre séries (reduz 429 em Cloudflare/ComexStat)
         await new Promise((r) => setTimeout(r, 1500));
         const expSeriesRaw = await fetchBasketAnnualSeries({
@@ -991,7 +951,7 @@ export default function CgimAnalyticsPage() {
             cacheTtlHours: 24,
         });
 
-        if (cancelled || myChartsReqId !== chartsRequestIdRef.current) return;
+        if (cancelled) return;
 
         const impSeries = impSeriesRaw.map((p) => ({
           name: String(p.year),
@@ -1087,7 +1047,7 @@ export default function CgimAnalyticsPage() {
         subsKg.sort((a, b) => (b.kg || 0) - (a.kg || 0));
         setSubcatBarsKg(subsKg.slice(0, 25));
       } catch (e: any) {
-        if (cancelled || myChartsReqId !== chartsRequestIdRef.current) return;
+        if (cancelled) return;
         setChartsError(
           e?.message ? String(e.message) : "Erro ao carregar gráficos."
         );
@@ -1422,16 +1382,16 @@ const compositionSubcategoryTextKg =
     setError(null);
     setLastUpdated(null);
     setEntity(next);
-    resetChartsState();
+    setChartsActive(false);
     setCgimActive(false);
   }}
 
   year={year}
   years={years}
-  onChangeYear={(next) => { setYear(next); resetChartsState(); }}
+  onChangeYear={(next) => setYear(next)}
 
   flow={flow}
-  onChangeFlow={(next) => { setFlow(next); resetChartsState(); }}
+  onChangeFlow={(next) => setFlow(next)}
 
   viewMode={viewMode}
   onChangeViewMode={(next) => setViewMode(next)}
