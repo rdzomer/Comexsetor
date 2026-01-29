@@ -915,12 +915,14 @@ export default function CgimAnalyticsPage() {
           return;
         }
 
-        const yearStart = Math.max(2010, year - 10);
+        // 🔒 Janela histórica menor para reduzir 429 (pode ajustar: 5, 8, 10...)
+        const YEARS_WINDOW = 3;
+        const yearStart = Math.max(2010, year - YEARS_WINDOW);
         const yearEnd = year;
 
         // ✅ Padrão NCM: séries anuais separadas para Importação e Exportação
-        const [impSeriesRaw, expSeriesRaw] = await Promise.all([
-          fetchBasketAnnualSeries({
+        // ✅ Fetch sequencial (evita rajada: reduz 429).
+        const impSeriesRaw = await fetchBasketAnnualSeries({
             flow: "import",
             yearStart,
             yearEnd,
@@ -928,8 +930,11 @@ export default function CgimAnalyticsPage() {
             lite: true,
             useCache: true,
             cacheTtlHours: 24,
-          }),
-          fetchBasketAnnualSeries({
+        });
+        if (cancelled) return;
+        // 🕒 Espaçamento entre séries (reduz 429 em Cloudflare/ComexStat)
+        await new Promise((r) => setTimeout(r, 2500));
+        const expSeriesRaw = await fetchBasketAnnualSeries({
             flow: "export",
             yearStart,
             yearEnd,
@@ -937,8 +942,7 @@ export default function CgimAnalyticsPage() {
             lite: true,
             useCache: true,
             cacheTtlHours: 24,
-          }),
-        ]);
+        });
 
         if (cancelled) return;
 

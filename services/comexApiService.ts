@@ -143,6 +143,48 @@ function sleep(ms: number): Promise<void> {
 
 
 
+
+// ==================
+// ✅ AÇÃO MÍNIMA: proteção contra 429 e repetição de chamadas
+// - limita concorrência de /general (evita "rajadas" que estouram rate limit)
+// - deduplica chamadas idênticas em voo (rerender/efeito duplicado não duplica request)
+// - cache curto em memória (evita refetch do mesmo payload imediatamente)
+// ==================
+const GENERAL_CONCURRENCY = 1; // ajuste mínimo; 1 = mais lento, mas quase sem 429
+const GENERAL_MIN_INTERVAL_MS = 3500; // espaçamento mínimo entre POST /general (reduz 429; pode aumentar)
+let lastGeneralRequestAt = 0;
+let generalActive = 0;
+const generalQueue: Array<() => void> = [];
+
+async function withGeneralSlot<T>(fn: () => Promise<T>): Promise<T> {
+  if (generalActive >= GENERAL_CONCURRENCY) {
+    await new Promise<void>((resolve) => generalQueue.push(resolve));
+  }
+  generalActive++;
+  // 🔧 AÇÃO MÍNIMA: espaça requisições /general para reduzir 429 (API pede ~10s em caso de limite)
+  const now = Date.now();
+  const diff = now - lastGeneralRequestAt;
+  if (diff >= 0 && diff < GENERAL_MIN_INTERVAL_MS) {
+    await sleep(GENERAL_MIN_INTERVAL_MS - diff);
+  }
+  lastGeneralRequestAt = Date.now();
+  try {
+    return await fn();
+  } finally {
+    generalActive--;
+    const next = generalQueue.shift();
+    if (next) next();
+  }
+}
+
+const GENERAL_CACHE_TTL_MS = 2 * 60 * 1000; // 2 min
+const generalCache = new Map<string, { ts: number; value: any }>();
+const generalInFlight = new Map<string, Promise<any>>();
+
+function makeGeneralKey(url: string, body: any): string {
+  // JSON stringify é suficiente aqui porque o body é determinístico (mesma ordem de arrays)
+  return `${url}::${JSON.stringify(body)}`;
+}
 /**
  * 🔧 AÇÃO MÍNIMA (auditoria):
  * Corrige payload legado quando alguém usa "noNcmpt" como filtro (errado) passando código NCM.
@@ -378,20 +420,65 @@ async function comexGeneralRequestWithMeta(payload: any, timeoutMs = DEFAULT_TIM
 
     const body = isNewShape ? sanitized : legacyToNewGeneralBody(sanitized);
 
-    const res = await fetchWithTimeout(url, timeoutMs, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Accept: "application/json" },
-      body: JSON.stringify(body),
-    });
-
-    if (!res.ok) {
-      const txt = await res.text().catch(() => "");
-      console.warn("[comexApiService] /general falhou:", res.status, res.statusText, txt);
-      return { ok: false, status: res.status, statusText: res.statusText, rows: [], errorText: txt };
+    // ✅ dedupe + cache curto (evita chamadas repetidas idênticas por re-render/efeitos)
+    const key = makeGeneralKey(url, body);
+    const cached = generalCache.get(key);
+    if (cached && Date.now() - cached.ts < GENERAL_CACHE_TTL_MS) {
+      return cached.value;
+    }
+    const inflight = generalInFlight.get(key);
+    if (inflight) {
+      return await inflight;
     }
 
-    const json = await res.json();
-    return { ok: true, status: res.status, statusText: res.statusText, rows: extractRows(json) };
+    const promise = withGeneralSlot(async () => {
+      const MAX_RETRIES_429 = 8;
+
+      for (let attempt = 0; attempt <= MAX_RETRIES_429; attempt++) {
+        const res = await fetchWithTimeout(url, timeoutMs, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Accept: "application/json" },
+          body: JSON.stringify(body),
+        });
+
+        if (res.status === 429) {
+          // tenta respeitar Retry-After se vier; senão aplica backoff progressivo com jitter
+          const ra = res.headers?.get?.("Retry-After");
+          const raMs = ra ? Number(ra) * 1000 : NaN;
+          const base = Number.isFinite(raMs) && raMs > 0 ? raMs : 12_000;
+          const backoff = base * Math.min(6, Math.max(1, attempt + 1)); // 12s, 24s, 36s... (cap)
+          const jitter = Math.floor(Math.random() * 1500);
+          const waitMs = backoff + jitter;
+          const txt429 = await res.text().catch(() => "");
+          console.warn("[comexApiService] 429 em /general. Aguardando", waitMs, "ms. Detalhe:", txt429);
+          await sleep(waitMs);
+          continue;
+          continue;
+        }
+
+        if (!res.ok) {
+          const txt = await res.text().catch(() => "");
+          console.warn("[comexApiService] /general falhou:", res.status, res.statusText, txt);
+          return { ok: false, status: res.status, statusText: res.statusText, rows: [], errorText: txt };
+        }
+
+        const json = await res.json();
+        const out = { ok: true, status: res.status, statusText: res.statusText, rows: extractRows(json) };
+        generalCache.set(key, { ts: Date.now(), value: out });
+        return out;
+      }
+
+      // se chegou aqui, estourou retentativas 429
+      return { ok: false, status: 429, statusText: "Too Many Requests", rows: [], errorText: "429 after retries" };
+    });
+
+    generalInFlight.set(key, promise);
+
+    try {
+      return await promise;
+    } finally {
+      generalInFlight.delete(key);
+    }
   } catch (e: any) {
     console.warn("[comexApiService] Falha ao consultar /general (POST). Retornando lista vazia.", e);
     return { ok: false, status: 0, statusText: "NETWORK_ERROR", rows: [], errorText: String(e?.message ?? e) };
