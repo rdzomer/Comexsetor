@@ -8,7 +8,8 @@ export type BasketAnnualPoint = {
   usdPerTon: number;
 };
 
-// Configuração de Chunking para evitar "URI Too Long" ou 429 no filtro
+// Tamanho do lote de NCMs por requisição.
+// 500 é seguro para o payload do MDIC.
 const NCM_CHUNK_SIZE = 500; 
 
 function getTradeFlow(uiFlow: TradeFlowUi): TradeFlow {
@@ -21,6 +22,7 @@ export async function fetchBasketAnnualSeries(args: {
   yearStart: number;
   yearEnd: number;
   ncms: string[];
+  useCache?: boolean;
 }): Promise<BasketAnnualPoint[]> {
   const { flowUi, yearStart, yearEnd, ncms } = args;
   
@@ -31,14 +33,19 @@ export async function fetchBasketAnnualSeries(args: {
   for (let y = yearStart; y <= yearEnd; y++) years.push(y);
 
   // 2. Cache Key (Simples)
-  const cacheKey = `cgim_series_v2_${args.entityName}_${flowUi}_${yearStart}_${yearEnd}_${ncms.length}`;
-  const cached = sessionStorage.getItem(cacheKey);
-  if (cached) {
-    console.log(`[TimeSeries] Cache Hit para ${args.entityName}`);
-    return JSON.parse(cached);
+  // Se mudar entidade, fluxo ou quantidade de NCMs, invalida o cache.
+  const cacheKey = `cgim_series_v3_${args.entityName}_${flowUi}_${yearStart}_${yearEnd}_${ncms.length}`;
+  
+  if (args.useCache !== false) {
+    const cached = sessionStorage.getItem(cacheKey);
+    if (cached) {
+      console.log(`[TimeSeries] Cache Hit para ${args.entityName}`);
+      return JSON.parse(cached);
+    }
   }
 
   // 3. Prepara Chunks de NCM
+  // Dividimos os NCMs em grupos para não enviar um JSON gigante de uma vez
   const chunks: string[][] = [];
   for (let i = 0; i < ncms.length; i += NCM_CHUNK_SIZE) {
     chunks.push(ncms.slice(i, i + NCM_CHUNK_SIZE));
@@ -46,11 +53,11 @@ export async function fetchBasketAnnualSeries(args: {
 
   console.log(`[TimeSeries] Buscando série ${yearStart}-${yearEnd} para ${ncms.length} NCMs em ${chunks.length} lotes.`);
 
-  // 4. Executa requisições (Agregadas por Ano)
-  // Usamos Promise.all para disparar os chunks em paralelo (limitado pelo navegador)
-  // Como cada request retorna SÓ os totais anuais, é leve.
-  
+  // 4. Executa requisições
   const flow = getTradeFlow(flowUi);
+  
+  // Dispara as requisições dos chunks. 
+  // O Promise.all roda em paralelo, mas como são poucos chunks (ex: 2 ou 3), não dá erro 429.
   const promises = chunks.map(chunk => 
     fetchAggregatedSeriesByNcmList({ flow, years, ncms: chunk })
   );
@@ -60,9 +67,10 @@ export async function fetchBasketAnnualSeries(args: {
   // 5. Consolida os resultados (Soma os chunks)
   const totalsByYear = new Map<number, { fob: number; kg: number }>();
 
-  // Inicializa mapa com zeros para garantir que todos anos apareçam (inclusive vazios)
+  // Inicializa mapa com zeros para todos os anos solicitados
   years.forEach(y => totalsByYear.set(y, { fob: 0, kg: 0 }));
 
+  // Soma os resultados que vieram da API
   results.flat().forEach(row => {
     const current = totalsByYear.get(row.year);
     if (current) {
@@ -73,7 +81,7 @@ export async function fetchBasketAnnualSeries(args: {
 
   // 6. Formata saída final
   const output: BasketAnnualPoint[] = Array.from(totalsByYear.entries())
-    .sort((a, b) => a[0] - b[0]) // Ordena por ano
+    .sort((a, b) => a[0] - b[0]) // Ordena por ano (crescente)
     .map(([year, val]) => ({
       year,
       fob: val.fob,
@@ -81,7 +89,7 @@ export async function fetchBasketAnnualSeries(args: {
       usdPerTon: val.kg > 0 ? val.fob / val.kg : 0
     }));
 
-  // 7. Salva no Cache
+  // 7. Salva no Cache da Sessão
   try {
     sessionStorage.setItem(cacheKey, JSON.stringify(output));
   } catch (e) {
